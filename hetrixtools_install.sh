@@ -2,7 +2,7 @@
 #
 #
 #	HetrixTools Server Monitoring Agent - Install Script
-#	Copyright 2015 - 2025 @  HetrixTools
+#	Copyright 2015 - 2026 @  HetrixTools
 #	For support, please open a ticket on our website https://hetrixtools.com
 #
 #
@@ -126,11 +126,11 @@ if command -v crontab >/dev/null 2>&1; then
 		USE_CRON=1
 	fi
 fi
-if [ "$USE_CRON" -ne 1 ] && [ "$SYSTEMCTL_AVAILABLE" -eq 1 ]; then
+if [ "$USE_CRON" -ne 1 ] && [ "$SYSTEMCTL_AVAILABLE" -eq 1 ] && command -v systemd-run >/dev/null 2>&1; then
 	USE_SYSTEMD=1
 fi
 if [ "$USE_CRON" -ne 1 ] && [ "$USE_SYSTEMD" -ne 1 ]; then
-	echo "ERROR: Neither cron nor systemd is available to schedule the agent." >&2
+	echo "ERROR: Neither cron nor systemd with systemd-run is available to schedule the agent." >&2
 	exit 1
 fi
 echo "... done."
@@ -201,6 +201,15 @@ then
 fi
 echo "... done."
 
+# Check if reboot required should be checked
+echo "Checking if reboot required should be checked..."
+if [ "$8" = "0" ]
+then
+	echo "Disabling reboot required check in the agent config..."
+	sed -i "s/CheckReboot=1/CheckReboot=0/" /etc/hetrixtools/hetrixtools.cfg
+fi
+echo "... done."
+
 # Check if 'View running processes' should be enabled
 echo "Checking if 'View running processes' should be enabled..."
 if [ "$6" -eq "1" ]
@@ -265,6 +274,8 @@ if [ "$SYSTEMCTL_AVAILABLE" -eq 1 ]; then
 fi
 rm -f /etc/systemd/system/hetrixtools_agent.timer >/dev/null 2>&1
 rm -f /etc/systemd/system/hetrixtools_agent.service >/dev/null 2>&1
+rm -f /etc/hetrixtools/hetrixtools_systemd_launcher.sh >/dev/null 2>&1
+rm -f /usr/local/sbin/hetrixtools_systemd_launcher.sh >/dev/null 2>&1
 
 # Setup the new systemd or cronjob timer to run the agent every minute
 if [ "$USE_CRON" -eq 1 ]
@@ -281,22 +292,50 @@ then
 elif [ "$USE_SYSTEMD" -eq 1 ]
 then
 	echo "Setting up systemd timer..."
-		if [ "$2" -eq "1" ]
-		then
+	if [ "$2" -eq "1" ]
+	then
 		SERVICE_USER=root
-		else
+	else
 		SERVICE_USER=hetrixtools
-		fi
-	cat > /etc/systemd/system/hetrixtools_agent.service <<EOF
+	fi
+	cat > /usr/local/sbin/hetrixtools_systemd_launcher.sh <<-'EOF'
+#!/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+ServiceUser=$1
+if [ "$ServiceUser" != "root" ] && [ "$ServiceUser" != "hetrixtools" ]
+then
+	ServiceUser=root
+fi
+
+if ! command -v systemd-run >/dev/null 2>&1
+then
+	echo "ERROR: systemd-run is required for systemd timer scheduling." >&2
+	exit 1
+fi
+
+RunID=$(date +%s)-$$
+UnitName="hetrixtools_agent_${RunID}"
+AgentCommand='exec /bin/bash /etc/hetrixtools/hetrixtools_agent.sh >> /etc/hetrixtools/hetrixtools_cron.log 2>&1'
+
+if [ "$ServiceUser" = "root" ]
+then
+	systemd-run --quiet --collect --unit="$UnitName" /bin/bash -c "$AgentCommand"
+else
+	systemd-run --quiet --collect --unit="$UnitName" --property="User=$ServiceUser" /bin/bash -c "$AgentCommand"
+fi
+EOF
+	chown root:root /usr/local/sbin/hetrixtools_systemd_launcher.sh >/dev/null 2>&1
+	chmod 700 /usr/local/sbin/hetrixtools_systemd_launcher.sh
+	cat > /etc/systemd/system/hetrixtools_agent.service <<-EOF
 [Unit]
-Description=HetrixTools Agent
+Description=HetrixTools Agent Launcher
 
 [Service]
 Type=oneshot
-User=$SERVICE_USER
-ExecStart=/bin/bash /etc/hetrixtools/hetrixtools_agent.sh
+ExecStart=/bin/bash /usr/local/sbin/hetrixtools_systemd_launcher.sh $SERVICE_USER
 EOF
-	cat > /etc/systemd/system/hetrixtools_agent.timer <<EOF
+	cat > /etc/systemd/system/hetrixtools_agent.timer <<-EOF
 [Unit]
 Description=Runs HetrixTools agent every minute
 

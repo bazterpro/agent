@@ -2,7 +2,7 @@
 #
 #
 #	HetrixTools Server Monitoring Agent - Update Script
-#	Copyright 2015 - 2025 @  HetrixTools
+#	Copyright 2015 - 2026 @  HetrixTools
 #	For support, please open a ticket on our website https://hetrixtools.com
 #
 #
@@ -57,6 +57,9 @@ detect_agent_run_user() {
 			if [ -f "$systemd_unit" ]; then
 				detected_user=$(awk -F= '/^User=/{print $2; exit}' "$systemd_unit" 2>/dev/null)
 				if [ -z "$detected_user" ]; then
+					detected_user=$(awk '/hetrixtools_systemd_launcher\.sh/ {print $NF; exit}' "$systemd_unit" 2>/dev/null)
+				fi
+				if [ -z "$detected_user" ]; then
 					detected_user=root
 				fi
 				break
@@ -81,22 +84,165 @@ AGENT="/etc/hetrixtools/hetrixtools_agent.sh"
 # Old Config Path
 CONFIG="/etc/hetrixtools/hetrixtools.cfg"
 
-# Check if user specified branch to update to
-if [ -z "$1" ]
-then
-	BRANCH="master"
-else
-	BRANCH=$1
-fi
+BRANCH="master"
+BRANCH_SET=0
+FORCE_UPDATE=0
 
-# Check if the selected branch exists
-if github_wget --spider -q https://raw.githubusercontent.com/hetrixtools/agent/$BRANCH/hetrixtools_agent.sh
-then
-	echo "Updating to $BRANCH branch..."
-else
-	echo "ERROR: Branch $BRANCH does not exist." >&2
-	exit 1
-fi
+# Parse arguments
+for ARG in "$@"
+do
+	case "$ARG" in
+		-force|--force)
+			FORCE_UPDATE=1
+			;;
+		-h|--help)
+			echo "Usage: $0 [-force|--force] [branch]"
+			exit 0
+			;;
+		-*)
+			echo "ERROR: Unknown option: $ARG" >&2
+			echo "Usage: $0 [-force|--force] [branch]" >&2
+			exit 1
+			;;
+		*)
+			if [ "$BRANCH_SET" -eq 1 ]
+			then
+				echo "ERROR: Multiple branches specified." >&2
+				echo "Usage: $0 [-force|--force] [branch]" >&2
+				exit 1
+			fi
+			BRANCH=$ARG
+			BRANCH_SET=1
+			;;
+	esac
+done
+
+extract_agent_version() {
+	sed -n "s/^[[:space:]]*Version[[:space:]]*=[[:space:]]*['\"]\\{0,1\\}\\([^'\"[:space:]#]*\\).*/\\1/p" "$1" 2>/dev/null | head -n 1
+}
+
+cleanup_update_tmp_dir() {
+	if [ -n "$UPDATE_TMP_DIR" ] && [ -d "$UPDATE_TMP_DIR" ]
+	then
+		rm -rf "$UPDATE_TMP_DIR"
+	fi
+	if [ -n "$STAGED_AGENT" ] && [ -f "$STAGED_AGENT" ]
+	then
+		rm -f "$STAGED_AGENT"
+	fi
+	if [ -n "$STAGED_CONFIG" ] && [ -f "$STAGED_CONFIG" ]
+	then
+		rm -f "$STAGED_CONFIG"
+	fi
+	if [ -n "$STAGED_CONFIG" ] && [ -f "$STAGED_CONFIG.tmp" ]
+	then
+		rm -f "$STAGED_CONFIG.tmp"
+	fi
+}
+
+copy_file_metadata() {
+	local reference_file=$1
+	local target_file=$2
+	local file_owner=""
+	local file_mode=""
+
+	if [ ! -e "$reference_file" ]
+	then
+		return 0
+	fi
+
+	if ! chown --reference="$reference_file" "$target_file" >/dev/null 2>&1
+	then
+		file_owner=$(stat -c '%u:%g' "$reference_file" 2>/dev/null)
+		if [ -n "$file_owner" ]
+		then
+			chown "$file_owner" "$target_file" >/dev/null 2>&1 || return 1
+		fi
+	fi
+
+	if ! chmod --reference="$reference_file" "$target_file" >/dev/null 2>&1
+	then
+		file_mode=$(stat -c '%a' "$reference_file" 2>/dev/null)
+		if [ -n "$file_mode" ]
+		then
+			chmod "$file_mode" "$target_file" >/dev/null 2>&1 || return 1
+		fi
+	fi
+}
+
+prepare_staged_file() {
+	local source_file=$1
+	local target_file=$2
+	local staged_file=$3
+
+	if ! cp "$source_file" "$staged_file"
+	then
+		return 1
+	fi
+
+	if id -u hetrixtools >/dev/null 2>&1
+	then
+		chown hetrixtools:hetrixtools "$staged_file" >/dev/null 2>&1 || return 1
+		chmod 700 "$staged_file" >/dev/null 2>&1 || return 1
+	elif [ -e "$target_file" ]
+	then
+		copy_file_metadata "$target_file" "$staged_file" || true
+	fi
+
+	return 0
+}
+
+extract_config_value() {
+	local key=$1
+	local file=$2
+
+		awk -v key="$key" '
+			$0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+				sub("^[[:space:]]*" key "[[:space:]]*=[[:space:]]*", "")
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+				if (($0 ~ /^".*"$/) || ($0 ~ /^'\''.*'\''$/)) {
+					$0 = substr($0, 2, length($0) - 2)
+			}
+			print
+			exit
+		}
+	' "$file" | tr -d '\r'
+}
+
+replace_config_line() {
+	local file=$1
+	local old_line=$2
+	local new_line=$3
+	local tmp_file="$file.tmp"
+
+	if awk -v old_line="$old_line" -v new_line="$new_line" '
+		$0 == old_line { print new_line; next }
+		{ print }
+	' "$file" > "$tmp_file"
+	then
+		if [ -e "$file" ]
+		then
+			copy_file_metadata "$file" "$tmp_file" || true
+		fi
+		if ! mv "$tmp_file" "$file"
+		then
+			echo "ERROR: Failed to update the staged agent configuration." >&2
+			rm -f "$tmp_file"
+			exit 1
+		fi
+	else
+		echo "ERROR: Failed to update the staged agent configuration." >&2
+		rm -f "$tmp_file"
+		exit 1
+	fi
+}
+
+# Check for wget
+echo "Checking wget..."
+command -v wget >/dev/null 2>&1 || { echo "ERROR: wget is required to run this agent." >&2; exit 1; }
+echo "... done."
+
+echo "Using $BRANCH branch..."
 # Check if update script is run by root
 echo "Checking root privileges..."
 if [ "$EUID" -ne 0 ]
@@ -105,9 +251,72 @@ if [ "$EUID" -ne 0 ]
 fi
 echo "... done."
 
-# Check for required system utilities (wget + either cron or systemd)
+# Look for the old agent
+echo "Looking for the old agent..."
+if [ -f "$AGENT" ]
+then
+	echo "... done."
+else
+	echo "ERROR: No old agent found. Nothing to update." >&2; exit 1;
+fi
+
+UPDATE_TMP_DIR=$(mktemp -d /tmp/hetrixtools_update.XXXXXX 2>/dev/null || mktemp -d)
+if [ -z "$UPDATE_TMP_DIR" ] || [ ! -d "$UPDATE_TMP_DIR" ]
+then
+	echo "ERROR: Unable to create a temporary update directory." >&2
+	exit 1
+fi
+trap cleanup_update_tmp_dir EXIT
+NEW_AGENT="$UPDATE_TMP_DIR/hetrixtools_agent.sh"
+NEW_CONFIG="$UPDATE_TMP_DIR/hetrixtools.cfg"
+STAGED_AGENT="$AGENT.update.$$"
+STAGED_CONFIG="$CONFIG.update.$$"
+
+# Fetching the available agent to check its version
+echo "Checking available agent version..."
+if ! github_wget -t 1 -T 30 -qO "$NEW_AGENT" https://raw.githubusercontent.com/hetrixtools/agent/$BRANCH/hetrixtools_agent.sh
+then
+	echo "ERROR: Failed to download the agent script from GitHub for branch/tag $BRANCH." >&2
+	exit 1
+fi
+CURRENT_VERSION=$(extract_agent_version "$AGENT")
+AVAILABLE_VERSION=$(extract_agent_version "$NEW_AGENT")
+DISPLAY_CURRENT_VERSION=$CURRENT_VERSION
+DISPLAY_AVAILABLE_VERSION=$AVAILABLE_VERSION
+if [ -z "$DISPLAY_CURRENT_VERSION" ]
+then
+	DISPLAY_CURRENT_VERSION="unknown"
+fi
+if [ -z "$DISPLAY_AVAILABLE_VERSION" ]
+then
+	DISPLAY_AVAILABLE_VERSION="unknown"
+fi
+echo "Installed agent version: $DISPLAY_CURRENT_VERSION"
+echo "Available agent version: $DISPLAY_AVAILABLE_VERSION"
+if [ -z "$CURRENT_VERSION" ]
+then
+	echo "WARNING: Unable to determine the installed agent version; proceeding with update." >&2
+fi
+if [ -z "$AVAILABLE_VERSION" ]
+then
+	echo "WARNING: Unable to determine the available agent version; proceeding with update." >&2
+fi
+if [ -n "$CURRENT_VERSION" ] && [ -n "$AVAILABLE_VERSION" ] && [ "$CURRENT_VERSION" = "$AVAILABLE_VERSION" ]
+then
+	if [ "$FORCE_UPDATE" -eq 1 ]
+	then
+		echo "Force update requested; reinstalling the current version."
+	else
+		echo "HetrixTools agent is already at latest version ($CURRENT_VERSION). Use -force option to reinstall the current version."
+		exit 0
+	fi
+else
+	echo "Version differs or could not be determined; updating the agent."
+fi
+echo "... done."
+
+# Check for required system utilities (either cron or systemd)
 echo "Checking system utilities..."
-command -v wget >/dev/null 2>&1 || { echo "ERROR: wget is required to run this agent." >&2; exit 1; }
 USE_CRON=0
 USE_SYSTEMD=0
 SYSTEMCTL_AVAILABLE=0
@@ -153,23 +362,14 @@ if command -v crontab >/dev/null 2>&1; then
 		USE_CRON=1
 	fi
 fi
-if [ "$USE_CRON" -ne 1 ] && [ "$SYSTEMCTL_AVAILABLE" -eq 1 ]; then
+if [ "$USE_CRON" -ne 1 ] && [ "$SYSTEMCTL_AVAILABLE" -eq 1 ] && command -v systemd-run >/dev/null 2>&1; then
 	USE_SYSTEMD=1
 fi
 if [ "$USE_CRON" -ne 1 ] && [ "$USE_SYSTEMD" -ne 1 ]; then
-	echo "ERROR: Neither cron nor systemd is available to schedule the agent." >&2
+	echo "ERROR: Neither cron nor systemd with systemd-run is available to schedule the agent." >&2
 	exit 1
 fi
 echo "... done."
-
-# Look for the old agent
-echo "Looking for the old agent..."
-if [ -f "$AGENT" ]
-then
-	echo "... done."
-else
-	echo "ERROR: No old agent found. Nothing to update." >&2; exit 1;
-fi
 
 # Look for the old config
 echo "Looking for the old config file..."
@@ -192,61 +392,80 @@ echo "... done."
 # Extract data from the old agent
 echo "Extracting configs from the old agent..."
 # SID (Server ID)
-SID=$(grep 'SID="' $EXTRACT | awk -F'"' '{ print $2 }')
+SID=$(extract_config_value 'SID' "$EXTRACT")
 # Network Interfaces
-NetworkInterfaces=$(grep 'NetworkInterfaces="' $EXTRACT | awk -F'"' '{ print $2 }')
+NetworkInterfaces=$(extract_config_value 'NetworkInterfaces' "$EXTRACT")
 # Ignored Disks
 IgnoredDisksLine=$(grep '^IgnoredDisks=' "$EXTRACT")
 # Check Services
-CheckServices=$(grep 'CheckServices="' $EXTRACT | awk -F'"' '{ print $2 }')
+CheckServices=$(extract_config_value 'CheckServices' "$EXTRACT")
 # Check Software RAID Health
-CheckSoftRAID=$(grep 'CheckSoftRAID=' $EXTRACT | awk -F'=' '{ print $2 }')
+CheckSoftRAID=$(extract_config_value 'CheckSoftRAID' "$EXTRACT" | tr -d '[:space:]')
+if [ "$CheckSoftRAID" != "1" ]
+then
+	CheckSoftRAID=0
+fi
 # Check Drive Health
-CheckDriveHealth=$(grep 'CheckDriveHealth=' $EXTRACT | awk -F'=' '{ print $2 }')
+CheckDriveHealth=$(extract_config_value 'CheckDriveHealth' "$EXTRACT" | tr -d '[:space:]')
+if [ "$CheckDriveHealth" != "1" ]
+then
+	CheckDriveHealth=0
+fi
+# Check Reboot Required
+CheckReboot=$(extract_config_value 'CheckReboot' "$EXTRACT" | tr -d '[:space:]')
+if [ "$CheckReboot" != "0" ]
+then
+	CheckReboot=1
+fi
 # RunningProcesses
-RunningProcesses=$(grep 'RunningProcesses=' $EXTRACT | awk -F'=' '{ print $2 }')
-if [ -z "$RunningProcesses" ]
+RunningProcesses=$(extract_config_value 'RunningProcesses' "$EXTRACT" | tr -d '[:space:]')
+if [ "$RunningProcesses" != "1" ]
 then
 	RunningProcesses=0
 fi
 echo "... done."
 # Port Connections
-ConnectionPorts=$(grep 'ConnectionPorts="' $EXTRACT | awk -F'"' '{ print $2 }')
+ConnectionPorts=$(extract_config_value 'ConnectionPorts' "$EXTRACT")
 if [ -f "$CONFIG" ]
 then
 	# Custom Variables
-	CustomVars=$(grep 'CustomVars="' $EXTRACT | awk -F'"' '{ print $2 }')
+	CustomVars=$(extract_config_value 'CustomVars' "$EXTRACT")
 	# Secured Connection
-	SecuredConnection=$(grep 'SecuredConnection=' $EXTRACT | awk -F'=' '{ print $2 }')
+	SecuredConnection=$(extract_config_value 'SecuredConnection' "$EXTRACT")
 	# CollectEveryXSeconds
-	CollectEveryXSeconds=$(grep 'CollectEveryXSeconds=' $EXTRACT | awk -F'=' '{ print $2 }')
+	CollectEveryXSeconds=$(extract_config_value 'CollectEveryXSeconds' "$EXTRACT")
 	# OutgoingPings
-	OutgoingPings=$(grep 'OutgoingPings="' $EXTRACT | awk -F'"' '{ print $2 }')
+	OutgoingPings=$(extract_config_value 'OutgoingPings' "$EXTRACT")
 	# OutgoingPingsCount
-	OutgoingPingsCount=$(grep 'OutgoingPingsCount=' $EXTRACT | awk -F'=' '{ print $2 }')
+	OutgoingPingsCount=$(extract_config_value 'OutgoingPingsCount' "$EXTRACT")
 fi
-
-# Fetching the new agent
-echo "Fetching the new agent..."
-if ! github_wget -t 1 -T 30 -qO $AGENT https://raw.githubusercontent.com/hetrixtools/agent/$BRANCH/hetrixtools_agent.sh
-then
-	echo "ERROR: Failed to download the agent script from GitHub." >&2
-	exit 1
-fi
-echo "... done."
 
 # Fetching the new config file
 echo "Fetching the new config file..."
-if ! github_wget -t 1 -T 30 -qO /etc/hetrixtools/hetrixtools.cfg https://raw.githubusercontent.com/hetrixtools/agent/$BRANCH/hetrixtools.cfg
+if ! github_wget -t 1 -T 30 -qO "$NEW_CONFIG" https://raw.githubusercontent.com/hetrixtools/agent/$BRANCH/hetrixtools.cfg
 then
 	echo "ERROR: Failed to download the agent configuration from GitHub." >&2
 	exit 1
 fi
 echo "... done."
 
+# Preparing the new agent and config file
+echo "Preparing the new agent and config file..."
+if ! prepare_staged_file "$NEW_AGENT" "$AGENT" "$STAGED_AGENT"
+then
+	echo "ERROR: Failed to prepare the new agent script." >&2
+	exit 1
+fi
+if ! prepare_staged_file "$NEW_CONFIG" "$CONFIG" "$STAGED_CONFIG"
+then
+	echo "ERROR: Failed to prepare the new agent configuration." >&2
+	exit 1
+fi
+echo "... done."
+
 # Inserting Server ID (SID) into the agent config
 echo "Inserting Server ID (SID) into agent config..."
-sed -i "s/SID=\"\"/SID=\"$SID\"/" /etc/hetrixtools/hetrixtools.cfg
+replace_config_line "$STAGED_CONFIG" 'SID=""' "SID=\"$SID\""
 echo "... done."
 
 # Check if any network interfaces are specified
@@ -254,7 +473,7 @@ echo "Checking if any network interfaces are specified..."
 if [ ! -z "$NetworkInterfaces" ]
 then
 	echo "Network interfaces found, inserting them into the agent config..."
-	sed -i "s/NetworkInterfaces=\"\"/NetworkInterfaces=\"$NetworkInterfaces\"/" /etc/hetrixtools/hetrixtools.cfg
+	replace_config_line "$STAGED_CONFIG" 'NetworkInterfaces=""' "NetworkInterfaces=\"$NetworkInterfaces\""
 fi
 echo "... done."
 
@@ -266,11 +485,15 @@ then
 	if awk -v replacement="$IgnoredDisksLine" '
 		/^IgnoredDisks=/ { print replacement; next }
 		{ print }
-	' /etc/hetrixtools/hetrixtools.cfg > /etc/hetrixtools/hetrixtools.cfg.tmp
+	' "$STAGED_CONFIG" > "$STAGED_CONFIG.tmp"
 	then
-		mv /etc/hetrixtools/hetrixtools.cfg.tmp /etc/hetrixtools/hetrixtools.cfg
+		if [ -e "$STAGED_CONFIG" ]
+		then
+			copy_file_metadata "$STAGED_CONFIG" "$STAGED_CONFIG.tmp" || true
+		fi
+		mv "$STAGED_CONFIG.tmp" "$STAGED_CONFIG"
 	else
-		rm -f /etc/hetrixtools/hetrixtools.cfg.tmp
+		rm -f "$STAGED_CONFIG.tmp"
 		echo "WARNING: Failed to preserve IgnoredDisks during update." >&2
 	fi
 fi
@@ -281,34 +504,43 @@ echo "Checking if any services should be monitored..."
 if [ ! -z "$CheckServices" ]
 then
 	echo "Services found, inserting them into the agent config..."
-	sed -i "s/CheckServices=\"\"/CheckServices=\"$CheckServices\"/" /etc/hetrixtools/hetrixtools.cfg
+	replace_config_line "$STAGED_CONFIG" 'CheckServices=""' "CheckServices=\"$CheckServices\""
 fi
 echo "... done."
 
 # Check if Software RAID should be monitored
 echo "Checking if software RAID should be monitored..."
-if [ "$CheckSoftRAID" -eq "1" ]
+if [ "$CheckSoftRAID" = "1" ]
 then
 	echo "Enabling software RAID monitoring in the agent config..."
-	sed -i "s/CheckSoftRAID=0/CheckSoftRAID=1/" /etc/hetrixtools/hetrixtools.cfg
+	replace_config_line "$STAGED_CONFIG" 'CheckSoftRAID=0' 'CheckSoftRAID=1'
 fi
 echo "... done."
 
 # Check if Drive Health should be monitored
 echo "Checking if Drive Health should be monitored..."
-if [ "$CheckDriveHealth" -eq "1" ]
+if [ "$CheckDriveHealth" = "1" ]
 then
 	echo "Enabling Drive Health monitoring in the agent config..."
-	sed -i "s/CheckDriveHealth=0/CheckDriveHealth=1/" /etc/hetrixtools/hetrixtools.cfg
+	replace_config_line "$STAGED_CONFIG" 'CheckDriveHealth=0' 'CheckDriveHealth=1'
+fi
+echo "... done."
+
+# Check if reboot required should be checked
+echo "Checking if reboot required should be checked..."
+if [ "$CheckReboot" = "0" ]
+then
+	echo "Disabling reboot required check in the agent config..."
+	replace_config_line "$STAGED_CONFIG" 'CheckReboot=1' 'CheckReboot=0'
 fi
 echo "... done."
 
 # Check if 'View running processes' should be enabled
 echo "Checking if 'View running processes' should be enabled..."
-if [ "$RunningProcesses" -eq "1" ]
+if [ "$RunningProcesses" = "1" ]
 then
 	echo "Enabling 'View running processes' in the agent config..."
-	sed -i "s/RunningProcesses=0/RunningProcesses=1/" /etc/hetrixtools/hetrixtools.cfg
+	replace_config_line "$STAGED_CONFIG" 'RunningProcesses=0' 'RunningProcesses=1'
 fi
 echo "... done."
 
@@ -317,7 +549,7 @@ echo "Checking if any ports to monitor number of connections on..."
 if [ ! -z "$ConnectionPorts" ]
 then
 	echo "Ports found, inserting them into the agent config..."
-	sed -i "s/ConnectionPorts=\"\"/ConnectionPorts=\"$ConnectionPorts\"/" /etc/hetrixtools/hetrixtools.cfg
+	replace_config_line "$STAGED_CONFIG" 'ConnectionPorts=""' "ConnectionPorts=\"$ConnectionPorts\""
 fi
 echo "... done."
 
@@ -326,7 +558,7 @@ echo "Checking if any custom variables are specified..."
 if [ ! -z "$CustomVars" ]
 then
 	echo "Custom variables found, inserting them into the agent config..."
-	sed -i "s/CustomVars=\"custom_variables.json\"/CustomVars=\"$CustomVars\"/" /etc/hetrixtools/hetrixtools.cfg
+	replace_config_line "$STAGED_CONFIG" 'CustomVars="custom_variables.json"' "CustomVars=\"$CustomVars\""
 fi
 echo "... done."
 
@@ -335,7 +567,7 @@ echo "Checking if secured connection is enabled..."
 if [ ! -z "$SecuredConnection" ]
 then
 	echo "Inserting secured connection in the agent config..."
-	sed -i "s/SecuredConnection=1/SecuredConnection=$SecuredConnection/" /etc/hetrixtools/hetrixtools.cfg
+	replace_config_line "$STAGED_CONFIG" 'SecuredConnection=1' "SecuredConnection=$SecuredConnection"
 fi
 echo "... done."
 
@@ -344,7 +576,7 @@ echo "Checking CollectEveryXSeconds..."
 if [ ! -z "$CollectEveryXSeconds" ]
 then
 	echo "Inserting CollectEveryXSeconds in the agent config..."
-	sed -i "s/CollectEveryXSeconds=3/CollectEveryXSeconds=$CollectEveryXSeconds/" /etc/hetrixtools/hetrixtools.cfg
+	replace_config_line "$STAGED_CONFIG" 'CollectEveryXSeconds=3' "CollectEveryXSeconds=$CollectEveryXSeconds"
 fi
 
 # Check OutgoingPings
@@ -352,7 +584,7 @@ echo "Checking OutgoingPings..."
 if [ ! -z "$OutgoingPings" ]
 then
 	echo "Inserting OutgoingPings in the agent config..."
-	sed -i "s/OutgoingPings=\"\"/OutgoingPings=\"$OutgoingPings\"/" /etc/hetrixtools/hetrixtools.cfg
+	replace_config_line "$STAGED_CONFIG" 'OutgoingPings=""' "OutgoingPings=\"$OutgoingPings\""
 fi
 
 # Check OutgoingPingsCount
@@ -360,8 +592,23 @@ echo "Checking OutgoingPingsCount..."
 if [ ! -z "$OutgoingPingsCount" ]
 then
 	echo "Inserting OutgoingPingsCount in the agent config..."
-	sed -i "s/OutgoingPingsCount=20/OutgoingPingsCount=$OutgoingPingsCount/" /etc/hetrixtools/hetrixtools.cfg
+	replace_config_line "$STAGED_CONFIG" 'OutgoingPingsCount=20' "OutgoingPingsCount=$OutgoingPingsCount"
 fi
+
+# Atomically install the staged agent and config file
+echo "Installing the new agent and config file..."
+if ! mv "$STAGED_CONFIG" "$CONFIG"
+then
+	echo "ERROR: Failed to install the new agent configuration." >&2
+	exit 1
+fi
+if ! mv "$STAGED_AGENT" "$AGENT"
+then
+	echo "ERROR: Failed to install the new agent script." >&2
+	exit 1
+fi
+echo "... done."
+rm -f /etc/hetrixtools/hetrixtools_reboot_check.cache >/dev/null 2>&1
 
 # Refresh scheduler configuration (prefer cron when available)
 if [ "$USE_CRON" -eq 1 ]
@@ -397,6 +644,8 @@ then
 	fi
 	rm -f /etc/systemd/system/hetrixtools_agent.timer >/dev/null 2>&1
 	rm -f /etc/systemd/system/hetrixtools_agent.service >/dev/null 2>&1
+	rm -f /etc/hetrixtools/hetrixtools_systemd_launcher.sh >/dev/null 2>&1
+	rm -f /usr/local/sbin/hetrixtools_systemd_launcher.sh >/dev/null 2>&1
 	echo "... done."
 elif [ "$USE_SYSTEMD" -eq 1 ]
 then
@@ -411,30 +660,58 @@ then
 			crontab -u hetrixtools -l 2>/dev/null | grep -v 'hetrixtools_agent.sh' | crontab -u hetrixtools - >/dev/null 2>&1
 		fi
 	fi
-	cat > /etc/systemd/system/hetrixtools_agent.service <<EOF
-[Unit]
-Description=HetrixTools Agent
+	cat > /usr/local/sbin/hetrixtools_systemd_launcher.sh <<-'EOF'
+#!/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-[Service]
-Type=oneshot
-User=$SERVICE_USER
-ExecStart=/bin/bash /etc/hetrixtools/hetrixtools_agent.sh
+ServiceUser=$1
+if [ "$ServiceUser" != "root" ] && [ "$ServiceUser" != "hetrixtools" ]
+then
+	ServiceUser=root
+fi
+
+if ! command -v systemd-run >/dev/null 2>&1
+then
+	echo "ERROR: systemd-run is required for systemd timer scheduling." >&2
+	exit 1
+fi
+
+RunID=$(date +%s)-$$
+UnitName="hetrixtools_agent_${RunID}"
+AgentCommand='exec /bin/bash /etc/hetrixtools/hetrixtools_agent.sh >> /etc/hetrixtools/hetrixtools_cron.log 2>&1'
+
+if [ "$ServiceUser" = "root" ]
+then
+	systemd-run --quiet --collect --unit="$UnitName" /bin/bash -c "$AgentCommand"
+else
+	systemd-run --quiet --collect --unit="$UnitName" --property="User=$ServiceUser" /bin/bash -c "$AgentCommand"
+fi
 EOF
-	cat > /etc/systemd/system/hetrixtools_agent.timer <<EOF
-[Unit]
-Description=Runs HetrixTools agent every minute
+	chown root:root /usr/local/sbin/hetrixtools_systemd_launcher.sh >/dev/null 2>&1
+	chmod 700 /usr/local/sbin/hetrixtools_systemd_launcher.sh
+	cat > /etc/systemd/system/hetrixtools_agent.service <<-EOF
+		[Unit]
+		Description=HetrixTools Agent Launcher
 
-[Timer]
-OnBootSec=1min
-OnCalendar=*-*-* *:*:00 UTC
-AccuracySec=1s
-RandomizedDelaySec=0
-Persistent=true
-Unit=hetrixtools_agent.service
+		[Service]
+		Type=oneshot
+		ExecStart=/bin/bash /usr/local/sbin/hetrixtools_systemd_launcher.sh $SERVICE_USER
+		EOF
+	cat > /etc/systemd/system/hetrixtools_agent.timer <<-EOF
+		[Unit]
+		Description=Runs HetrixTools agent every minute
 
-[Install]
-WantedBy=timers.target
-EOF
+		[Timer]
+		OnBootSec=1min
+		OnCalendar=*-*-* *:*:00 UTC
+		AccuracySec=1s
+		RandomizedDelaySec=0
+		Persistent=true
+		Unit=hetrixtools_agent.service
+
+		[Install]
+		WantedBy=timers.target
+		EOF
 	systemctl daemon-reload >/dev/null 2>&1
 	systemctl enable --now hetrixtools_agent.timer >/dev/null 2>&1
 	systemctl restart hetrixtools_agent.timer >/dev/null 2>&1

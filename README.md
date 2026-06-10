@@ -4,6 +4,12 @@ Documentation available here: https://docs.hetrixtools.com/category/server-monit
 
 ### Changelog
 
+#### Version 2.4.1:
+- Improved the install and update scripts
+- Added the `CheckReboot` configuration
+- Disabled `needs-restarting` checking on non-sqlite or unknown RPMDB backends
+- `needs-restarting` on sqlite-backed RPMDB systems is now performed once per hour
+
 #### Version 2.4.0:
 - Added support for Outgoing Pings on defined ports
 - Improved RAM metrics collection

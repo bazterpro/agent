@@ -24,7 +24,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ScriptPath=$(dirname "${BASH_SOURCE[0]}")
 
 # Agent Version (do not change)
-Version="2.4.0"
+Version="2.4.1"
 
 # Load configuration file
 if [ -f "$ScriptPath"/hetrixtools.cfg ]
@@ -34,6 +34,11 @@ else
 	exit 1
 fi
 DisksIgnoreFilter="$IgnoredDisks"
+CheckReboot=$(printf '%s' "$CheckReboot" | tr -d '[:space:]')
+if ! [[ "$CheckReboot" =~ ^[01]$ ]]
+then
+	CheckReboot=1
+fi
 
 function filterignoreddisks() {
 	if [ -n "$DisksIgnoreFilter" ]
@@ -76,6 +81,107 @@ function serviceprocessrunning() {
 	else
 		(( $(ps -eo args= | grep -E "(^|/)${service_regex}([[:space:]]|$)" | grep -v "grep" | wc -l) > 0 ))
 	fi
+}
+
+function rpmdbhassqlitebackend() {
+	[ -f /var/lib/rpm/rpmdb.sqlite ] || [ -f /usr/lib/sysimage/rpm/rpmdb.sqlite ]
+}
+
+function filemtime() {
+	stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
+function writerebootcheckcache() {
+	printf '%s %s\n' "$1" "$2" 2>/dev/null > "$3"
+}
+
+function debugrebootcheckcache() {
+	local CacheFile=$1
+	local CacheDir=""
+	local CacheDirState=""
+	local CacheState=""
+	local CacheContent=""
+
+	if [ "$DEBUG" -ne 1 ]
+	then
+		return 0
+	fi
+
+	CacheDir=${CacheFile%/*}
+	[ "$CacheDir" = "$CacheFile" ] && CacheDir="."
+	CacheDirState=$(ls -ld "$CacheDir" 2>/dev/null)
+
+	if [ -e "$CacheFile" ]
+	then
+		CacheState=$(ls -ld "$CacheFile" 2>/dev/null)
+		CacheContent=$(cat "$CacheFile" 2>/dev/null) || CacheContent="[unreadable]"
+		echo -e "$ScriptStartTime-$(date +%T]) Reboot check cache file: $CacheFile directory: $CacheDirState state: $CacheState content: $CacheContent" >> "$ScriptPath"/debug.log
+	else
+		echo -e "$ScriptStartTime-$(date +%T]) Reboot check cache file: $CacheFile directory: $CacheDirState state: missing" >> "$ScriptPath"/debug.log
+	fi
+}
+
+function rpmpackagetoolrunning() {
+	if command -v "pgrep" > /dev/null 2>&1
+	then
+		pgrep -x rpm > /dev/null 2>&1 ||
+		pgrep -x dnf > /dev/null 2>&1 ||
+		pgrep -x dnf-3 > /dev/null 2>&1 ||
+		pgrep -x dnf5 > /dev/null 2>&1 ||
+		pgrep -x yum > /dev/null 2>&1 ||
+		pgrep -x microdnf > /dev/null 2>&1 ||
+		pgrep -x rpm-ostree > /dev/null 2>&1 ||
+		pgrep -x dnf-automatic > /dev/null 2>&1 ||
+		pgrep -x yum-cron > /dev/null 2>&1 ||
+		pgrep -x packagekitd > /dev/null 2>&1 ||
+		pgrep -f '(^|[[:space:]/])needs-restarting([[:space:]]|$)' > /dev/null 2>&1
+	else
+		ps -eo comm= 2>/dev/null | grep -Eq '^(rpm|dnf|dnf-3|dnf5|yum|microdnf|rpm-ostree|dnf-automatic|yum-cron|packagekitd)$' ||
+		ps -eo args= 2>/dev/null | grep -E '(^|[[:space:]/])needs-restarting([[:space:]]|$)' | grep -v grep > /dev/null 2>&1
+	fi
+}
+
+function timeoutsupportskillafter() {
+	command -v "timeout" > /dev/null 2>&1 && timeout --help 2>&1 | grep -q -- '-k'
+}
+
+function needsrestartingwithtimeout() {
+	local OutputFile=""
+	local CmdPID=""
+	local TimeoutPID=""
+	local ExitCode=0
+
+	if timeoutsupportskillafter
+	then
+		LC_ALL=C timeout -s TERM -k 15s 15s needs-restarting -r
+		return $?
+	fi
+
+	OutputFile=$(mktemp "${TMPDIR:-/tmp}/hetrixtools_needs_restarting.XXXXXX" 2>/dev/null)
+	if [ -z "$OutputFile" ]
+	then
+		return 125
+	fi
+
+	LC_ALL=C needs-restarting -r > "$OutputFile" 2>&1 &
+	CmdPID=$!
+
+	(
+		sleep 15
+		kill -TERM "$CmdPID" > /dev/null 2>&1
+		sleep 15
+		kill -KILL "$CmdPID" > /dev/null 2>&1
+	) &
+	TimeoutPID=$!
+
+	wait "$CmdPID" > /dev/null 2>&1
+	ExitCode=$?
+	kill "$TimeoutPID" > /dev/null 2>&1
+	wait "$TimeoutPID" > /dev/null 2>&1
+
+	cat "$OutputFile"
+	rm -f "$OutputFile"
+	return "$ExitCode"
 }
 
 # Service status function
@@ -960,9 +1066,10 @@ User=$(whoami)
 
 # Check if system requires reboot
 RequiresReboot=0
-if [ -f  /var/run/reboot-required ]
+if [ "$CheckReboot" -eq 1 ] && [ -f  /var/run/reboot-required ]
 then
 	RequiresReboot=1
+	if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Reboot required by /var/run/reboot-required" >> "$ScriptPath"/debug.log; fi
 fi
 
 # Operating System
@@ -978,18 +1085,89 @@ then
 elif [ -f /etc/redhat-release ]
 then
 	OS=$(cat /etc/redhat-release)
-	# Check if system is CloudLinux release 8 (CL8 will only output "This system is receiving updates from CloudLinux Network server.")
-	if [[ "$OS" != "CloudLinux release 8."* ]]
-	then
-		# Check if system requires reboot (Only supported in CentOS/RHEL 7 and later, with yum-utils installed)
-		if timeout -s 9 5 needs-restarting -r | grep -q 'Reboot is required'
-		then
-			RequiresReboot=1
-		fi
-	fi
 # If all else fails
 else
 	OS="$(grep '^PRETTY_NAME=' /etc/os-release | awk -F'"' '{print $2}')" || OS="$(uname -s)" || OS="Linux"
+fi
+
+# Avoid needs-restarting unless an sqlite RPMDB is present; BDB readers can leave the RPMDB in recovery state if too slow to respond and are killed
+if [ -f /etc/redhat-release ]
+then
+	if [ "$CheckReboot" -eq 1 ]
+	then
+		if ! rpmdbhassqlitebackend
+		then
+			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Reboot check skipped because RPMDB sqlite backend was not detected" >> "$ScriptPath"/debug.log; fi
+		elif ! command -v "needs-restarting" > /dev/null 2>&1
+		then
+			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Reboot check skipped because needs-restarting was not found" >> "$ScriptPath"/debug.log; fi
+		else
+			RebootCheckCache="$ScriptPath"/hetrixtools_reboot_check.cache
+			if [ -r /proc/sys/kernel/random/boot_id ]
+			then
+				read -r RebootCheckBootID < /proc/sys/kernel/random/boot_id
+			fi
+			[ -n "$RebootCheckBootID" ] || RebootCheckBootID="unknown"
+			debugrebootcheckcache "$RebootCheckCache"
+			if [ -f "$RebootCheckCache" ]
+			then
+				read -r CachedRebootCheckBootID CachedRequiresReboot < "$RebootCheckCache"
+			fi
+			RebootCheckCacheFresh=0
+			RebootCheckCacheSameBoot=0
+			if [ "$CachedRebootCheckBootID" = "$RebootCheckBootID" ] && [[ "$CachedRequiresReboot" =~ ^[01]$ ]]
+			then
+				RebootCheckCacheSameBoot=1
+				RebootCheckCacheMTime=$(filemtime "$RebootCheckCache")
+				RebootCheckNow=$(date +%s)
+				if [[ "$RebootCheckCacheMTime" =~ ^[0-9]+$ ]] && [[ "$RebootCheckNow" =~ ^[0-9]+$ ]] &&
+					[ "$RebootCheckNow" -ge "$RebootCheckCacheMTime" ] && [ $(( RebootCheckNow - RebootCheckCacheMTime )) -lt 3600 ]
+				then
+					RebootCheckCacheFresh=1
+				fi
+			fi
+			if [ "$RebootCheckCacheFresh" -eq 1 ]
+			then
+				if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Reboot check using cache $RebootCheckCache value=$CachedRequiresReboot" >> "$ScriptPath"/debug.log; fi
+				if [ "$CachedRequiresReboot" = "1" ]
+				then
+					RequiresReboot=1
+				fi
+			else
+				if rpmpackagetoolrunning
+				then
+					if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Reboot check skipped because RPM package tools are running" >> "$ScriptPath"/debug.log; fi
+					if [ "$RebootCheckCacheSameBoot" -eq 1 ] && [ "$CachedRequiresReboot" = "1" ]
+					then
+						RequiresReboot=1
+					fi
+				else
+					NeedsRestartingRequiresReboot=0
+					NeedsRestartingOutput=$(needsrestartingwithtimeout)
+					NeedsRestartingExit=$?
+					if printf '%s\n' "$NeedsRestartingOutput" | grep -q 'Reboot is required'
+					then
+						NeedsRestartingRequiresReboot=1
+						RequiresReboot=1
+						writerebootcheckcache "$RebootCheckBootID" "$NeedsRestartingRequiresReboot" "$RebootCheckCache"
+						debugrebootcheckcache "$RebootCheckCache"
+						if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) needs-restarting reported reboot required, exit=$NeedsRestartingExit cache=$RebootCheckCache" >> "$ScriptPath"/debug.log; fi
+					elif [ "$NeedsRestartingExit" -eq 0 ]
+					then
+						writerebootcheckcache "$RebootCheckBootID" "$NeedsRestartingRequiresReboot" "$RebootCheckCache"
+						debugrebootcheckcache "$RebootCheckCache"
+						if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) needs-restarting reported no reboot required, cache=$RebootCheckCache" >> "$ScriptPath"/debug.log; fi
+					else
+						if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) needs-restarting failed or timed out, exit=$NeedsRestartingExit cache not updated" >> "$ScriptPath"/debug.log; fi
+						if [ "$CachedRebootCheckBootID" = "$RebootCheckBootID" ] && [ "$CachedRequiresReboot" = "1" ]
+						then
+							RequiresReboot=1
+						fi
+					fi
+				fi
+			fi
+		fi
+	fi
 fi
 OS=$(echo -ne "$OS" | base64 | tr -d '\n\r\t ')
 
@@ -1002,7 +1180,7 @@ Hostname=$(uname -n | base64 | tr -d '\n\r\t ')
 # Server uptime
 Uptime=$(awk '{print $1}' < /proc/uptime | awk '{printf "%18.0f",$1}' | xargs)
 
-if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) User: $User OS: $OS Kernel: $Kernel Hostname: $Hostname Uptime: $Uptime" >> "$ScriptPath"/debug.log; fi
+if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) User: $User OS: $OS Kernel: $Kernel Hostname: $Hostname Uptime: $Uptime RequiresReboot: $RequiresReboot" >> "$ScriptPath"/debug.log; fi
 
 # lscpu
 lscpu=$(lscpu)
@@ -1676,3 +1854,5 @@ else
 	# Post data
 	wget --retry-connrefused --waitretry=1 -t 3 -T 15 -qO- --post-file="$ScriptPath/hetrixtools_agent.log" $SecuredConnection https://sm.hetrixtools.net/v2/ &> /dev/null
 fi
+
+exit 0
