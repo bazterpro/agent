@@ -92,7 +92,7 @@ function filemtime() {
 }
 
 function writerebootcheckcache() {
-	printf '%s %s\n' "$1" "$2" 2>/dev/null > "$3"
+	{ printf '%s %s\n' "$1" "$2" > "$3"; } 2>/dev/null
 }
 
 function debugrebootcheckcache() {
