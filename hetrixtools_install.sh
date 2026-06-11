@@ -20,6 +20,7 @@
 
 # Set PATH
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+umask 077
 
 # Prefer IPv4 when fetching from GitHub, fallback to IPv6 if needed
 github_wget() {
@@ -32,6 +33,65 @@ github_wget() {
 		fi
 	fi
 	return 0
+}
+
+trim_config_value() {
+	local value=$1
+
+	value="${value#"${value%%[!$' \t\r\n']*}"}"
+	value="${value%"${value##*[!$' \t\r\n']}"}"
+	printf '%s' "$value"
+}
+
+normalize_connection_ports() {
+	local raw_ports=$1
+	local normalized_ports=""
+	local port
+	local port_number
+	local ports_array
+
+	IFS=',' read -r -a ports_array <<< "$raw_ports"
+	for port in "${ports_array[@]}"
+	do
+		port=$(trim_config_value "$port")
+		if [[ "$port" =~ ^[0-9]{1,5}$ ]]
+		then
+			port_number=$((10#$port))
+			if [ "$port_number" -ge 1 ] && [ "$port_number" -le 65535 ]
+			then
+				if [ -n "$normalized_ports" ]
+				then
+					normalized_ports="$normalized_ports,"
+				fi
+				normalized_ports="$normalized_ports$port_number"
+			fi
+		fi
+	done
+
+	printf '%s' "$normalized_ports"
+}
+
+normalize_service_names() {
+	local raw_services=$1
+	local normalized_services=""
+	local service_name
+	local services_array
+
+	IFS=',' read -r -a services_array <<< "$raw_services"
+	for service_name in "${services_array[@]}"
+	do
+		service_name=$(trim_config_value "$service_name")
+		if [[ "$service_name" =~ ^[A-Za-z0-9_.@:+-]+$ ]]
+		then
+			if [ -n "$normalized_services" ]
+			then
+				normalized_services="$normalized_services,"
+			fi
+			normalized_services="$normalized_services$service_name"
+		fi
+	done
+
+	printf '%s' "$normalized_services"
 }
 
 # Branch
@@ -51,6 +111,25 @@ if [ "$EUID" -ne 0 ]
 	exit 1
 fi
 echo "... done."
+
+apply_agent_permissions() {
+	local run_user=$1
+
+	if [ "$run_user" = "root" ]
+	then
+		chown root:root /etc/hetrixtools || return 1
+		chown root:root /etc/hetrixtools/hetrixtools_agent.sh || return 1
+		chown root:root /etc/hetrixtools/hetrixtools.cfg || return 1
+	else
+		chown hetrixtools:hetrixtools /etc/hetrixtools || return 1
+		chown hetrixtools:hetrixtools /etc/hetrixtools/hetrixtools_agent.sh || return 1
+		chown hetrixtools:hetrixtools /etc/hetrixtools/hetrixtools.cfg || return 1
+	fi
+
+	chmod 700 /etc/hetrixtools || return 1
+	chmod 700 /etc/hetrixtools/hetrixtools_agent.sh || return 1
+	chmod 600 /etc/hetrixtools/hetrixtools.cfg || return 1
+}
 
 # Check if the selected branch exists
 if github_wget --spider -q https://raw.githubusercontent.com/hetrixtools/agent/$BRANCH/hetrixtools_agent.sh
@@ -77,6 +156,18 @@ if [ -z "$2" ]
 	then echo "ERROR: Second parameter missing."
 	exit
 fi
+case "$2" in
+	1)
+		RUN_USER=root
+		;;
+	0)
+		RUN_USER=hetrixtools
+		;;
+	*)
+		echo "ERROR: Second parameter must be 0 for 'hetrixtools' or 1 for 'root'." >&2
+		exit 1
+		;;
+esac
 
 # Check for wget and cron/systemd availability
 echo "Checking system utilities..."
@@ -178,8 +269,12 @@ echo "... done."
 echo "Checking if any services should be monitored..."
 if [ "$3" != "0" ]
 then
-	echo "Services found, inserting them into the agent config..."
-	sed -i "s/CheckServices=\"\"/CheckServices=\"$3\"/" /etc/hetrixtools/hetrixtools.cfg
+	InstallCheckServices=$(normalize_service_names "$3")
+	if [ -n "$InstallCheckServices" ]
+	then
+		echo "Services found, inserting them into the agent config..."
+		sed -i "s/CheckServices=\"\"/CheckServices=\"$InstallCheckServices\"/" /etc/hetrixtools/hetrixtools.cfg
+	fi
 fi
 echo "... done."
 
@@ -223,8 +318,12 @@ echo "... done."
 echo "Checking if any ports to monitor number of connections on..."
 if [ "$7" != "0" ]
 then
-	echo "Ports found, inserting them into the agent config..."
-	sed -i "s/ConnectionPorts=\"\"/ConnectionPorts=\"$7\"/" /etc/hetrixtools/hetrixtools.cfg
+	InstallConnectionPorts=$(normalize_connection_ports "$7")
+	if [ -n "$InstallConnectionPorts" ]
+	then
+		echo "Ports found, inserting them into the agent config..."
+		sed -i "s/ConnectionPorts=\"\"/ConnectionPorts=\"$InstallConnectionPorts\"/" /etc/hetrixtools/hetrixtools.cfg
+	fi
 fi
 echo "... done."
 
@@ -243,15 +342,15 @@ then
 	userdel hetrixtools
 	echo "Creating the new hetrixtools user..."
 	useradd hetrixtools -r -d /etc/hetrixtools -s /bin/false
-	echo "Assigning permissions for the hetrixtools user..."
-	chown -R hetrixtools:hetrixtools /etc/hetrixtools
-	chmod -R 700 /etc/hetrixtools
 else
 	echo "The hetrixtools user doesn't exist, creating it now..."
 	useradd hetrixtools -r -d /etc/hetrixtools -s /bin/false
-	echo "Assigning permissions for the hetrixtools user..."
-	chown -R hetrixtools:hetrixtools /etc/hetrixtools
-	chmod -R 700 /etc/hetrixtools
+fi
+echo "Assigning permissions for the selected runtime user..."
+if ! apply_agent_permissions "$RUN_USER"
+then
+	echo "ERROR: Failed to assign permissions for the agent files." >&2
+	exit 1
 fi
 echo "... done."
 
@@ -281,7 +380,7 @@ rm -f /usr/local/sbin/hetrixtools_systemd_launcher.sh >/dev/null 2>&1
 if [ "$USE_CRON" -eq 1 ]
 then
 	# Default is running the agent as 'hetrixtools' user, unless chosen otherwise by the client when fetching the installation code from the hetrixtools website.
-	if [ "$2" -eq "1" ]
+	if [ "$RUN_USER" = "root" ]
 	then
 		echo "Setting up the new cronjob as 'root' user..."
 		crontab -u root -l 2>/dev/null | { cat; echo "* * * * * bash /etc/hetrixtools/hetrixtools_agent.sh >> /etc/hetrixtools/hetrixtools_cron.log 2>&1"; } | crontab -u root - >/dev/null 2>&1
@@ -292,12 +391,7 @@ then
 elif [ "$USE_SYSTEMD" -eq 1 ]
 then
 	echo "Setting up systemd timer..."
-	if [ "$2" -eq "1" ]
-	then
-		SERVICE_USER=root
-	else
-		SERVICE_USER=hetrixtools
-	fi
+	SERVICE_USER=$RUN_USER
 	cat > /usr/local/sbin/hetrixtools_systemd_launcher.sh <<-'EOF'
 #!/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -374,7 +468,7 @@ wget -t 1 -T 30 -qO- --post-data "$POST" https://sm.hetrixtools.net/ &> /dev/nul
 echo "... done."
 
 # Start the agent
-if [ "$2" -eq "1" ]
+if [ "$RUN_USER" = "root" ]
 then
 	echo "Starting the agent under the 'root' user..."
 	bash /etc/hetrixtools/hetrixtools_agent.sh > /dev/null 2>&1 &

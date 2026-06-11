@@ -9,6 +9,8 @@ Documentation available here: https://docs.hetrixtools.com/category/server-monit
 - Added the `CheckReboot` configuration
 - Disabled `needs-restarting` checking on non-sqlite or unknown RPMDB backends
 - `needs-restarting` on sqlite-backed RPMDB systems is now performed once per hour
+- Harden file permissions and config variables
+- Optimize performance
 
 #### Version 2.4.0:
 - Added support for Outgoing Pings on defined ports

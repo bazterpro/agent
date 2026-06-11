@@ -20,6 +20,7 @@
 
 # Set PATH
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+umask 077
 
 # Prefer IPv4 when fetching from GitHub, fallback to IPv6 if needed
 github_wget() {
@@ -34,11 +35,99 @@ github_wget() {
 	return 0
 }
 
+trim_config_value() {
+	local value=$1
+
+	value="${value#"${value%%[!$' \t\r\n']*}"}"
+	value="${value%"${value##*[!$' \t\r\n']}"}"
+	printf '%s' "$value"
+}
+
+normalize_connection_ports() {
+	local raw_ports=$1
+	local normalized_ports=""
+	local port
+	local port_number
+	local ports_array
+
+	IFS=',' read -r -a ports_array <<< "$raw_ports"
+	for port in "${ports_array[@]}"
+	do
+		port=$(trim_config_value "$port")
+		if [[ "$port" =~ ^[0-9]{1,5}$ ]]
+		then
+			port_number=$((10#$port))
+			if [ "$port_number" -ge 1 ] && [ "$port_number" -le 65535 ]
+			then
+				if [ -n "$normalized_ports" ]
+				then
+					normalized_ports="$normalized_ports,"
+				fi
+				normalized_ports="$normalized_ports$port_number"
+			fi
+		fi
+	done
+
+	printf '%s' "$normalized_ports"
+}
+
+normalize_service_names() {
+	local raw_services=$1
+	local normalized_services=""
+	local service_name
+	local services_array
+
+	IFS=',' read -r -a services_array <<< "$raw_services"
+	for service_name in "${services_array[@]}"
+	do
+		service_name=$(trim_config_value "$service_name")
+		if [[ "$service_name" =~ ^[A-Za-z0-9_.@:+-]+$ ]]
+		then
+			if [ -n "$normalized_services" ]
+			then
+				normalized_services="$normalized_services,"
+			fi
+			normalized_services="$normalized_services$service_name"
+		fi
+	done
+
+	printf '%s' "$normalized_services"
+}
+
+normalize_collect_interval() {
+	local collect_interval
+
+	collect_interval=$(printf '%s' "$1" | tr -d '[:space:]')
+	if ! [[ "$collect_interval" =~ ^[0-9]{1,2}$ ]] || [ "$collect_interval" -lt 1 ] || [ "$collect_interval" -gt 60 ]
+	then
+		collect_interval=3
+	fi
+
+	printf '%s' "$collect_interval"
+}
+
+normalize_secured_connection() {
+	local secured_connection
+
+	secured_connection=$(printf '%s' "$1" | tr -d '[:space:]')
+	if ! [[ "$secured_connection" =~ ^[01]$ ]]
+	then
+		secured_connection=1
+	fi
+
+	printf '%s' "$secured_connection"
+}
+
 # Detect whether the currently installed agent is configured to run as
 # 'root' or as the 'hetrixtools' user, using the existing cron/systemd setup.
+# As a last resort (non-standard schedulers we can't read, e.g. /etc/cron.d,
+# /etc/crontab, relocated systemd units), fall back to the owner of the
+# /etc/hetrixtools directory, which the install/update scripts always chown
+# to the user the agent runs as.
 detect_agent_run_user() {
 	local detected_user=""
 	local systemd_unit=""
+	local dir_owner=""
 
 	if command -v crontab >/dev/null 2>&1; then
 		if crontab -u root -l 2>/dev/null | grep -q 'hetrixtools_agent.sh'; then
@@ -59,19 +148,17 @@ detect_agent_run_user() {
 				if [ -z "$detected_user" ]; then
 					detected_user=$(awk '/hetrixtools_systemd_launcher\.sh/ {print $NF; exit}' "$systemd_unit" 2>/dev/null)
 				fi
-				if [ -z "$detected_user" ]; then
-					detected_user=root
-				fi
 				break
 			fi
 		done
 	fi
 
 	if [ "$detected_user" != "root" ] && [ "$detected_user" != "hetrixtools" ]; then
-		if id -u hetrixtools >/dev/null 2>&1; then
-			detected_user=hetrixtools
+		dir_owner=$(stat -c '%U' /etc/hetrixtools 2>/dev/null || stat -f '%Su' /etc/hetrixtools 2>/dev/null)
+		if [ "$dir_owner" = "root" ] || [ "$dir_owner" = "hetrixtools" ]; then
+			detected_user=$dir_owner
 		else
-			detected_user=root
+			detected_user=unknown
 		fi
 	fi
 
@@ -170,20 +257,115 @@ copy_file_metadata() {
 	fi
 }
 
+apply_agent_file_permissions() {
+	local run_user=$1
+	local target_file=$2
+	local file_mode=$3
+
+	if [ -z "$file_mode" ]
+	then
+		file_mode=700
+	fi
+
+	if [ "$run_user" = "root" ] || ! id -u hetrixtools >/dev/null 2>&1
+	then
+		chown root:root "$target_file" >/dev/null 2>&1 || return 1
+	else
+		chown hetrixtools:hetrixtools "$target_file" >/dev/null 2>&1 || return 1
+	fi
+	chmod "$file_mode" "$target_file" >/dev/null 2>&1 || return 1
+}
+
+custom_vars_file_path() {
+	local custom_vars=""
+	local base_dir=""
+	local custom_vars_path=""
+	local real_dir=""
+	local real_file=""
+
+	custom_vars=$(extract_config_value 'CustomVars' "$CONFIG" 2>/dev/null)
+	if [ -z "$custom_vars" ]
+	then
+		return 1
+	fi
+
+	case "$custom_vars" in
+		''|/*)
+			return 1
+			;;
+	esac
+
+	base_dir=$(cd -P -- /etc/hetrixtools 2>/dev/null && pwd) || return 1
+	custom_vars_path="$base_dir/$custom_vars"
+
+	if [ -L "$custom_vars_path" ] || [ ! -f "$custom_vars_path" ]
+	then
+		return 1
+	fi
+
+	real_dir=$(cd -P -- "$(dirname -- "$custom_vars_path")" 2>/dev/null && pwd) || return 1
+	real_file="$real_dir/$(basename -- "$custom_vars_path")"
+	case "$real_file" in
+		"$base_dir"/*)
+			printf '%s\n' "$real_file"
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+apply_custom_vars_permissions() {
+	local run_user=$1
+	local custom_vars_path=""
+
+	if [ "$run_user" != "hetrixtools" ] || ! id -u hetrixtools >/dev/null 2>&1
+	then
+		return 0
+	fi
+
+	custom_vars_path=$(custom_vars_file_path) || return 0
+	chown hetrixtools:hetrixtools "$custom_vars_path" >/dev/null 2>&1 || return 1
+	chmod 600 "$custom_vars_path" >/dev/null 2>&1 || return 1
+}
+
+apply_agent_permissions() {
+	local run_user=$1
+
+	if [ "$run_user" = "root" ] || ! id -u hetrixtools >/dev/null 2>&1
+	then
+		chown root:root /etc/hetrixtools >/dev/null 2>&1 || return 1
+	else
+		chown hetrixtools:hetrixtools /etc/hetrixtools >/dev/null 2>&1 || return 1
+	fi
+	chmod 700 /etc/hetrixtools >/dev/null 2>&1 || return 1
+	apply_agent_file_permissions "$run_user" "$AGENT" 700 || return 1
+	apply_agent_file_permissions "$run_user" "$CONFIG" 600 || return 1
+	apply_custom_vars_permissions "$run_user" || return 1
+}
+
 prepare_staged_file() {
 	local source_file=$1
 	local target_file=$2
 	local staged_file=$3
+	local file_mode=700
+
+	if [ "$target_file" = "$CONFIG" ]
+	then
+		file_mode=600
+	fi
 
 	if ! cp "$source_file" "$staged_file"
 	then
 		return 1
 	fi
 
-	if id -u hetrixtools >/dev/null 2>&1
+	if [ -n "$AGENT_RUNTIME_USER" ]
 	then
-		chown hetrixtools:hetrixtools "$staged_file" >/dev/null 2>&1 || return 1
-		chmod 700 "$staged_file" >/dev/null 2>&1 || return 1
+		apply_agent_file_permissions "$AGENT_RUNTIME_USER" "$staged_file" "$file_mode" || return 1
+	elif id -u hetrixtools >/dev/null 2>&1
+	then
+		apply_agent_file_permissions hetrixtools "$staged_file" "$file_mode" || return 1
 	elif [ -e "$target_file" ]
 	then
 		copy_file_metadata "$target_file" "$staged_file" || true
@@ -196,12 +378,37 @@ extract_config_value() {
 	local key=$1
 	local file=$2
 
-		awk -v key="$key" '
-			$0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
-				sub("^[[:space:]]*" key "[[:space:]]*=[[:space:]]*", "")
-				gsub(/^[[:space:]]+|[[:space:]]+$/, "")
-				if (($0 ~ /^".*"$/) || ($0 ~ /^'\''.*'\''$/)) {
-					$0 = substr($0, 2, length($0) - 2)
+	awk -v key="$key" '
+		function trim(value) {
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+			return value
+		}
+		function strip_comment(value,    output, char, previous_char, in_single, in_double, i) {
+			output = ""
+			previous_char = ""
+			in_single = 0
+			in_double = 0
+			for (i = 1; i <= length(value); i++) {
+				char = substr(value, i, 1)
+				if (char == "'\''" && in_double == 0) {
+					in_single = !in_single
+				} else if (char == "\"" && in_single == 0) {
+					in_double = !in_double
+				} else if (char == "#" && in_single == 0 && in_double == 0) {
+					if (previous_char == "" || previous_char ~ /[[:space:]]/) {
+						break
+					}
+				}
+				output = output char
+				previous_char = char
+			}
+			return output
+		}
+		$0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
+			sub("^[[:space:]]*" key "[[:space:]]*=[[:space:]]*", "")
+			$0 = trim(strip_comment($0))
+			if (($0 ~ /^".*"$/) || ($0 ~ /^'\''.*'\''$/)) {
+				$0 = substr($0, 2, length($0) - 2)
 			}
 			print
 			exit
@@ -387,6 +594,12 @@ fi
 # Detect the current runtime user before recreating cron/systemd entries later.
 echo "Detecting the current agent runtime user..."
 AGENT_RUNTIME_USER=$(detect_agent_run_user)
+if [ "$AGENT_RUNTIME_USER" != "root" ] && [ "$AGENT_RUNTIME_USER" != "hetrixtools" ]
+then
+	echo "ERROR: Unable to detect whether the current agent runs as 'root' or 'hetrixtools'." >&2
+	echo "Please re-run the agent install code provided by the HetrixTools platform." >&2
+	exit 1
+fi
 echo "... done."
 
 # Extract data from the old agent
@@ -398,7 +611,7 @@ NetworkInterfaces=$(extract_config_value 'NetworkInterfaces' "$EXTRACT")
 # Ignored Disks
 IgnoredDisksLine=$(grep '^IgnoredDisks=' "$EXTRACT")
 # Check Services
-CheckServices=$(extract_config_value 'CheckServices' "$EXTRACT")
+CheckServices=$(normalize_service_names "$(extract_config_value 'CheckServices' "$EXTRACT")")
 # Check Software RAID Health
 CheckSoftRAID=$(extract_config_value 'CheckSoftRAID' "$EXTRACT" | tr -d '[:space:]')
 if [ "$CheckSoftRAID" != "1" ]
@@ -425,15 +638,15 @@ then
 fi
 echo "... done."
 # Port Connections
-ConnectionPorts=$(extract_config_value 'ConnectionPorts' "$EXTRACT")
+ConnectionPorts=$(normalize_connection_ports "$(extract_config_value 'ConnectionPorts' "$EXTRACT")")
 if [ -f "$CONFIG" ]
 then
 	# Custom Variables
 	CustomVars=$(extract_config_value 'CustomVars' "$EXTRACT")
 	# Secured Connection
-	SecuredConnection=$(extract_config_value 'SecuredConnection' "$EXTRACT")
+	SecuredConnection=$(normalize_secured_connection "$(extract_config_value 'SecuredConnection' "$EXTRACT")")
 	# CollectEveryXSeconds
-	CollectEveryXSeconds=$(extract_config_value 'CollectEveryXSeconds' "$EXTRACT")
+	CollectEveryXSeconds=$(normalize_collect_interval "$(extract_config_value 'CollectEveryXSeconds' "$EXTRACT")")
 	# OutgoingPings
 	OutgoingPings=$(extract_config_value 'OutgoingPings' "$EXTRACT")
 	# OutgoingPingsCount
@@ -724,11 +937,11 @@ ps aux | grep -ie hetrixtools_agent.sh | awk '{print $2}' | xargs -r kill -9
 echo "... done."
 
 # Assign permissions
-echo "Assigning permissions for the hetrixtools user..."
-if id -u hetrixtools >/dev/null 2>&1
+echo "Assigning permissions for the selected runtime user..."
+if ! apply_agent_permissions "$AGENT_RUNTIME_USER"
 then
-	chown -R hetrixtools:hetrixtools /etc/hetrixtools
-	chmod -R 700 /etc/hetrixtools
+	echo "ERROR: Failed to assign permissions for the agent files." >&2
+	exit 1
 fi
 
 # Cleaning up update file

@@ -26,19 +26,198 @@ ScriptPath=$(dirname "${BASH_SOURCE[0]}")
 # Agent Version (do not change)
 Version="2.4.1"
 
+# Default configuration values
+SID=""
+NetworkInterfaces=""
+IgnoredDisks="tmpfs|aufs|squashfs|container_tmp"
+CheckServices=""
+CheckSoftRAID=0
+CheckDriveHealth=0
+CheckReboot=1
+RunningProcesses=0
+ConnectionPorts=""
+CustomVars="custom_variables.json"
+SecuredConnection=1
+CollectEveryXSeconds=3
+DEBUG=0
+OutgoingPings=""
+OutgoingPingsCount=20
+
+strip_config_comment() {
+	local input=$1
+	local output=""
+	local char previous_char=""
+	local in_single=0
+	local in_double=0
+	local i
+
+	for ((i = 0; i < ${#input}; i++))
+	do
+		char=${input:i:1}
+		if [ "$char" = "'" ] && [ "$in_double" -eq 0 ]
+		then
+			if [ "$in_single" -eq 1 ]
+			then
+				in_single=0
+			else
+				in_single=1
+			fi
+		elif [ "$char" = '"' ] && [ "$in_single" -eq 0 ]
+		then
+			if [ "$in_double" -eq 1 ]
+			then
+				in_double=0
+			else
+				in_double=1
+			fi
+		elif [ "$char" = "#" ] && [ "$in_single" -eq 0 ] && [ "$in_double" -eq 0 ]
+		then
+			if [ -z "$previous_char" ] || [[ "$previous_char" =~ [[:space:]] ]]
+			then
+				break
+			fi
+		fi
+		output="$output$char"
+		previous_char=$char
+	done
+
+	printf '%s' "$output"
+}
+
+trim_config_value() {
+	local value=$1
+
+	value="${value#"${value%%[!$' \t\r\n']*}"}"
+	value="${value%"${value##*[!$' \t\r\n']}"}"
+	printf '%s' "$value"
+}
+
+normalize_binary_setting() {
+	local value=$1
+	local default_value=$2
+
+	value=$(printf '%s' "$value" | tr -d '[:space:]')
+	if ! [[ "$value" =~ ^[01]$ ]]
+	then
+		value=$default_value
+	fi
+
+	printf '%s' "$value"
+}
+
+normalize_connection_ports() {
+	local raw_ports=$1
+	local normalized_ports=""
+	local port
+	local port_number
+	local ports_array
+
+	IFS=',' read -r -a ports_array <<< "$raw_ports"
+	for port in "${ports_array[@]}"
+	do
+		port=$(trim_config_value "$port")
+		if [[ "$port" =~ ^[0-9]{1,5}$ ]]
+		then
+			port_number=$((10#$port))
+			if [ "$port_number" -ge 1 ] && [ "$port_number" -le 65535 ]
+			then
+				if [ -n "$normalized_ports" ]
+				then
+					normalized_ports="$normalized_ports,"
+				fi
+				normalized_ports="$normalized_ports$port_number"
+			fi
+		fi
+	done
+
+	printf '%s' "$normalized_ports"
+}
+
+normalize_service_names() {
+	local raw_services=$1
+	local normalized_services=""
+	local service_name
+	local services_array
+
+	IFS=',' read -r -a services_array <<< "$raw_services"
+	for service_name in "${services_array[@]}"
+	do
+		service_name=$(trim_config_value "$service_name")
+		if [[ "$service_name" =~ ^[A-Za-z0-9_.@:+-]+$ ]]
+		then
+			if [ -n "$normalized_services" ]
+			then
+				normalized_services="$normalized_services,"
+			fi
+			normalized_services="$normalized_services$service_name"
+		fi
+	done
+
+	printf '%s' "$normalized_services"
+}
+
+load_config() {
+	local config_file=$1
+	local line key value value_length first_char last_char
+
+	if [ ! -f "$config_file" ]
+	then
+		return 1
+	fi
+
+	while IFS= read -r line || [ -n "$line" ]
+	do
+		line=${line%$'\r'}
+		case "$line" in
+			''|\#*)
+				continue
+				;;
+				*=*)
+					key=${line%%=*}
+					value=${line#*=}
+					key=$(trim_config_value "$key")
+					value=$(strip_config_comment "$value")
+					value=$(trim_config_value "$value")
+					value_length=${#value}
+				first_char=${value:0:1}
+				last_char=""
+				if [ "$value_length" -gt 0 ]
+				then
+					last_char=${value:$((value_length - 1)):1}
+				fi
+				if [ "$value_length" -ge 2 ] && { { [ "$first_char" = '"' ] && [ "$last_char" = '"' ]; } || { [ "$first_char" = "'" ] && [ "$last_char" = "'" ]; }; }
+				then
+					value=${value:1:$((value_length - 2))}
+				fi
+				case "$key" in
+					SID|NetworkInterfaces|IgnoredDisks|CheckServices|CheckSoftRAID|CheckDriveHealth|CheckReboot|RunningProcesses|ConnectionPorts|CustomVars|SecuredConnection|CollectEveryXSeconds|DEBUG|OutgoingPings|OutgoingPingsCount)
+						printf -v "$key" '%s' "$value"
+						;;
+				esac
+				;;
+		esac
+	done < "$config_file"
+}
+
 # Load configuration file
-if [ -f "$ScriptPath"/hetrixtools.cfg ]
+if ! load_config "$ScriptPath"/hetrixtools.cfg
 then
-	. "$ScriptPath"/hetrixtools.cfg
-else
 	exit 1
 fi
 DisksIgnoreFilter="$IgnoredDisks"
-CheckReboot=$(printf '%s' "$CheckReboot" | tr -d '[:space:]')
-if ! [[ "$CheckReboot" =~ ^[01]$ ]]
+CheckReboot=$(normalize_binary_setting "$CheckReboot" 1)
+CheckSoftRAID=$(normalize_binary_setting "$CheckSoftRAID" 0)
+CheckDriveHealth=$(normalize_binary_setting "$CheckDriveHealth" 0)
+RunningProcesses=$(normalize_binary_setting "$RunningProcesses" 0)
+DEBUG=$(normalize_binary_setting "$DEBUG" 0)
+CollectEveryXSeconds=$(printf '%s' "$CollectEveryXSeconds" | tr -d '[:space:]')
+if ! [[ "$CollectEveryXSeconds" =~ ^[0-9]{1,2}$ ]] || [ "$CollectEveryXSeconds" -lt 1 ] || [ "$CollectEveryXSeconds" -gt 60 ]
 then
-	CheckReboot=1
+	CollectEveryXSeconds=3
 fi
+SecuredConnection=$(normalize_binary_setting "$SecuredConnection" 1)
+CheckServices=$(normalize_service_names "$CheckServices")
+ConnectionPorts=$(normalize_connection_ports "$ConnectionPorts")
 
 function filterignoreddisks() {
 	if [ -n "$DisksIgnoreFilter" ]
@@ -218,6 +397,37 @@ function base64prep() {
 	echo "$str"
 }
 
+function customvarspath() {
+	local custom_vars=$1
+	local base_dir custom_vars_path real_dir real_file
+
+	case "$custom_vars" in
+		''|/*)
+			return 1
+			;;
+	esac
+
+	base_dir=$(cd -P -- "$ScriptPath" 2>/dev/null && pwd) || return 1
+	custom_vars_path="$base_dir/$custom_vars"
+
+	if [ -L "$custom_vars_path" ] || [ ! -f "$custom_vars_path" ]
+	then
+		return 1
+	fi
+
+	real_dir=$(cd -P -- "$(dirname -- "$custom_vars_path")" 2>/dev/null && pwd) || return 1
+	real_file="$real_dir/$(basename -- "$custom_vars_path")"
+	case "$real_file" in
+		"$base_dir"/*)
+			;;
+		*)
+			return 1
+			;;
+	esac
+
+	printf '%s\n' "$real_file"
+}
+
 function timems() {
 	local TimeNow
 	TimeNow=$(date +%s%3N 2>/dev/null)
@@ -242,8 +452,7 @@ function runwithtimeout() {
 		OutputFile=$(mktemp "${TMPDIR:-/tmp}/hetrixtools_tcp_probe.XXXXXX" 2>/dev/null)
 		if [ -z "$OutputFile" ]
 		then
-			OutputFile="/tmp/hetrixtools_tcp_probe.$$.$RANDOM"
-			: > "$OutputFile"
+			CaptureOutput=0
 		fi
 	fi
 	if command -v "timeout" > /dev/null 2>&1
@@ -665,8 +874,8 @@ then
 	fi
 	for cPort in "${ConnectionPortsArray[@]}"
 	do
-		Connections[$cPort]=$(echo "$ConnectionPeers" | grep -c ":$cPort$")
-		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Port $cPort Connections: ${Connections[$cPort]}" >> "$ScriptPath"/debug.log; fi
+		Connections["$cPort"]=$(echo "$ConnectionPeers" | grep -c ":$cPort$")
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Port $cPort Connections: ${Connections["$cPort"]}" >> "$ScriptPath"/debug.log; fi
 	done
 fi
 
@@ -682,8 +891,9 @@ then
 	IFS=',' read -r -a CheckServicesArray <<< "$CheckServices"
 	for i in "${CheckServicesArray[@]}"
 	do
-		SRVCSR[$i]=$(( ${SRVCSR[$i]} + $(servicestatus "$i") ))
-		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Service $i status: ${SRVCSR[$i]}" >> "$ScriptPath"/debug.log; fi
+		ServiceStatus=$(servicestatus "$i")
+		SRVCSR["$i"]=$(( ${SRVCSR["$i"]:-0} + ServiceStatus ))
+		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Service $i status: ${SRVCSR["$i"]}" >> "$ScriptPath"/debug.log; fi
 	done
 fi
 
@@ -738,15 +948,28 @@ then
 		current_second=$(date +%S | sed 's/^0*//')
 		remaining_seconds=$((58 - current_second))
 		declare -A pipes
+		declare -A pipe_dirs
 		declare -A pids
 		declare -A zpools_mountpoints
 		for pool in "${zpoolsray[@]}"
 		do
 			zpools_mountpoints[$pool]=$(zfs get -H -o value mountpoint "$pool")
-			pipe=$(mktemp -u)
-			mkfifo "$pipe"
+			pipe_dir=$(mktemp -d "${TMPDIR:-/tmp}/hetrixtools_zpool.XXXXXX" 2>/dev/null)
+			if [ -z "$pipe_dir" ]
+			then
+				if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Unable to create zpool temp directory for $pool" >> "$ScriptPath"/debug.log; fi
+				continue
+			fi
+			pipe="$pipe_dir/iostat.fifo"
+			if ! mkfifo "$pipe"
+			then
+				rmdir "$pipe_dir" 2>/dev/null
+				if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Unable to create zpool FIFO for $pool" >> "$ScriptPath"/debug.log; fi
+				continue
+			fi
+			pipe_dirs[$pool]="$pipe_dir"
 			pipes[$pool]="$pipe"
-			timeout 60 zpool iostat -v -p "$pool" "$remaining_seconds" 2 | awk 'BEGIN{found=0} /capacity/ {found++} found==2' | grep "$pool" > "$pipe" &
+			timeout 60 zpool iostat -v -p "$pool" "$remaining_seconds" 2 | awk 'BEGIN{found=0} /capacity/ {found++} found==2' | grep -F -- "$pool" > "$pipe" &
 			pids[$pool]=$!
 			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) zpool $pool mounted at ${zpools_mountpoints[$pool]} starting iostat pid ${pids[$pool]} pipe ${pipes[$pool]} for $remaining_seconds seconds" >> "$ScriptPath"/debug.log; fi
 		done
@@ -754,7 +977,7 @@ then
 fi
 
 # Calculate how many how many data sample loops
-RunTimes=$(echo | awk "{print 60 / $CollectEveryXSeconds}")
+RunTimes=$((60 / CollectEveryXSeconds))
 if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Collecting data for $RunTimes loops" >> "$ScriptPath"/debug.log; fi
 
 # Collect data loop
@@ -926,7 +1149,8 @@ do
 		netstat=$(ss -ntu | awk '{print $5}')
 		for cPort in "${ConnectionPortsArray[@]}"
 		do
-			Connections[$cPort]=$(echo | awk "{print ${Connections[$cPort]} + $(echo "$netstat" | grep -c ":$cPort$")}")
+			PortConnectionCount=$(echo "$netstat" | grep -c ":$cPort$")
+			Connections["$cPort"]=$(( ${Connections["$cPort"]:-0} + PortConnectionCount ))
 		done
 		if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) Port Connections: ${Connections[*]}" >> "$ScriptPath"/debug.log; fi
 	fi
@@ -1284,6 +1508,10 @@ then
 	then
 		for pool in "${zpoolsray[@]}"
 		do
+			if [ -z "${pipes[$pool]}" ]
+			then
+				continue
+			fi
 			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) zpool $pool mounted at ${zpools_mountpoints[$pool]} reading from iostat pipe" >> "$ScriptPath"/debug.log; fi
 			zpooloutput=$(<"${pipes[$pool]}")
 			if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) zpool $pool iostat output: $zpooloutput" >> "$ScriptPath"/debug.log; fi
@@ -1292,10 +1520,11 @@ then
 				read_bytes_per_sec=$(echo "$zpooloutput" | awk '{print $(NF-1)}')
 				write_bytes_per_sec=$(echo "$zpooloutput" | awk '{print $NF}')
 				if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) zpool $pool read bytes per sec: $read_bytes_per_sec write bytes per sec: $write_bytes_per_sec" >> "$ScriptPath"/debug.log; fi
-				kill "${pids[$pool]}" 2>/dev/null
-				rm "${pipes[$pool]}" 2>/dev/null
 				IOPS="$IOPS${zpools_mountpoints[$pool]},$read_bytes_per_sec,$write_bytes_per_sec;"
 			fi
+			kill "${pids[$pool]}" 2>/dev/null
+			rm -f "${pipes[$pool]}" 2>/dev/null
+			rmdir "${pipe_dirs[$pool]}" 2>/dev/null
 		done
 	fi
 fi
@@ -1333,7 +1562,7 @@ if [ -n "$ConnectionPorts" ]
 then
 	for cPort in "${ConnectionPortsArray[@]}"
 	do
-		CON=$(echo | awk "{print ${Connections[$cPort]} / $X}")
+		CON=$(awk -v connections="${Connections["$cPort"]:-0}" -v loops="$X" 'BEGIN {print connections / loops}')
 		CON=$(echo "$CON" | awk '{printf "%18.0f",$1}' | xargs)
 		CONN="$CONN$cPort,$CON;"
 	done
@@ -1363,8 +1592,9 @@ if [ -n "$CheckServices" ]
 then
 	for i in "${CheckServicesArray[@]}"
 	do
-		SRVCSR[$i]=$(( ${SRVCSR[$i]} + $(servicestatus "$i") ))
-		if [ "${SRVCSR[$i]}" -eq "0" ]
+		ServiceStatus=$(servicestatus "$i")
+		SRVCSR["$i"]=$(( ${SRVCSR["$i"]:-0} + ServiceStatus ))
+		if [ "${SRVCSR["$i"]}" -eq "0" ]
 		then
 			SRVCS="$SRVCS$i,0;"
 		else
@@ -1786,9 +2016,10 @@ if [ "$DEBUG" -eq 1 ]; then echo -e "$ScriptStartTime-$(date +%T]) DH: $DH" >> "
 CV=""
 if [ -n "$CustomVars" ]
 then
-	if [ -s "$ScriptPath"/"$CustomVars" ]
+	CustomVarsPath=$(customvarspath "$CustomVars")
+	if [ -n "$CustomVarsPath" ] && [ -f "$CustomVarsPath" ] && [ -s "$CustomVarsPath" ]
 	then
-		CV=$(< "$ScriptPath"/"$CustomVars" base64 | tr -d '\n\r\t ')
+		CV=$(< "$CustomVarsPath" base64 | tr -d '\n\r\t ')
 	fi
 fi
 
