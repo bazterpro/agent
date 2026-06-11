@@ -334,9 +334,9 @@ apply_agent_permissions() {
 
 	if [ "$run_user" = "root" ] || ! id -u hetrixtools >/dev/null 2>&1
 	then
-		chown root:root /etc/hetrixtools >/dev/null 2>&1 || return 1
+		chown -R root:root /etc/hetrixtools >/dev/null 2>&1 || return 1
 	else
-		chown hetrixtools:hetrixtools /etc/hetrixtools >/dev/null 2>&1 || return 1
+		chown -R hetrixtools:hetrixtools /etc/hetrixtools >/dev/null 2>&1 || return 1
 	fi
 	chmod 700 /etc/hetrixtools >/dev/null 2>&1 || return 1
 	apply_agent_file_permissions "$run_user" "$AGENT" 700 || return 1

@@ -117,13 +117,9 @@ apply_agent_permissions() {
 
 	if [ "$run_user" = "root" ]
 	then
-		chown root:root /etc/hetrixtools || return 1
-		chown root:root /etc/hetrixtools/hetrixtools_agent.sh || return 1
-		chown root:root /etc/hetrixtools/hetrixtools.cfg || return 1
+		chown -R root:root /etc/hetrixtools || return 1
 	else
-		chown hetrixtools:hetrixtools /etc/hetrixtools || return 1
-		chown hetrixtools:hetrixtools /etc/hetrixtools/hetrixtools_agent.sh || return 1
-		chown hetrixtools:hetrixtools /etc/hetrixtools/hetrixtools.cfg || return 1
+		chown -R hetrixtools:hetrixtools /etc/hetrixtools || return 1
 	fi
 
 	chmod 700 /etc/hetrixtools || return 1
