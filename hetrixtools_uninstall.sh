@@ -2,7 +2,7 @@
 #
 #
 #	HetrixTools Server Monitoring Agent - Uninstall Script
-#	Copyright 2015 - 2025 @  HetrixTools
+#	Copyright 2015 - 2026 @  HetrixTools
 #	For support, please open a ticket on our website https://hetrixtools.com
 #
 #
@@ -73,6 +73,7 @@ then
 	rm -f /etc/systemd/system/hetrixtools_agent.service
 	systemctl daemon-reload >/dev/null 2>&1
 fi
+rm -f /usr/local/sbin/hetrixtools_systemd_launcher.sh >/dev/null 2>&1
 echo "... done."
 
 # Removing cronjob (if exists)
