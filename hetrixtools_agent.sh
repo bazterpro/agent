@@ -190,7 +190,7 @@ load_config() {
 					value=${value:1:$((value_length - 2))}
 				fi
 				case "$key" in
-					SID|NetworkInterfaces|IgnoredDisks|CheckServices|CheckSoftRAID|CheckDriveHealth|CheckReboot|RunningProcesses|ConnectionPorts|CustomVars|SecuredConnection|CollectEveryXSeconds|DEBUG|OutgoingPings|OutgoingPingsCount)
+					SID|NetworkInterfaces|IgnoredDisks|CheckServices|CheckSoftRAID|CheckDriveHealth|CheckReboot|RunningProcesses|ConnectionPorts|CustomVars|CollectEveryXSeconds|DEBUG|OutgoingPings|OutgoingPingsCount)
 						printf -v "$key" '%s' "$value"
 						;;
 				esac
@@ -215,7 +215,7 @@ if ! [[ "$CollectEveryXSeconds" =~ ^[0-9]{1,2}$ ]] || [ "$CollectEveryXSeconds" 
 then
 	CollectEveryXSeconds=3
 fi
-SecuredConnection=$(normalize_binary_setting "$SecuredConnection" 1)
+SecuredConnection=1
 CheckServices=$(normalize_service_names "$CheckServices")
 ConnectionPorts=$(normalize_connection_ports "$ConnectionPorts")
 
@@ -2054,13 +2054,6 @@ then
 	# Save the current snapshot for next run
 	echo "$RPS2" > "$ScriptPath"/running_proc.txt
 fi
-# Secured Connection
-if [ "$SecuredConnection" -gt 0 ]
-then
-	SecuredConnection=""
-else
-	SecuredConnection="--no-check-certificate"
-fi
 
 # Current time/date
 Time=$(date +%Y-%m-%d\ %T\ %Z | base64 | tr -d '\n\r\t ')
@@ -2079,11 +2072,11 @@ then
 	echo -e "$ScriptStartTime-$(date +%T]) JSON:\n$json" >> "$ScriptPath"/debug.log
 	# Post data
 	echo -e "$ScriptStartTime-$(date +%T]) Posting data" >> "$ScriptPath"/debug.log
-	wget -v --debug --retry-connrefused --waitretry=1 -t 3 -T 15 -O- --post-file="$ScriptPath/hetrixtools_agent.log" $SecuredConnection https://sm.hetrixtools.net/v2/ &>> "$ScriptPath"/debug.log 
+	wget -v --debug --retry-connrefused --waitretry=1 -t 3 -T 15 -O- --post-file="$ScriptPath/hetrixtools_agent.log" https://sm.hetrixtools.net/v2/ &>> "$ScriptPath"/debug.log
 	echo -e "$ScriptStartTime-$(date +%T]) Data posted" >> "$ScriptPath"/debug.log
 else
 	# Post data
-	wget --retry-connrefused --waitretry=1 -t 3 -T 15 -qO- --post-file="$ScriptPath/hetrixtools_agent.log" $SecuredConnection https://sm.hetrixtools.net/v2/ &> /dev/null
+	wget --retry-connrefused --waitretry=1 -t 3 -T 15 -qO- --post-file="$ScriptPath/hetrixtools_agent.log" https://sm.hetrixtools.net/v2/ &> /dev/null
 fi
 
 exit 0

@@ -22,6 +22,27 @@
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 umask 077
 
+REPOSITORY="bazterpro/agent"
+RELEASE_REF="secure-v2.4.1-1"
+AGENT_SHA256="8be4502fac533e5dfb60533b5b2ab85510fe2b961948e1cf573bde6d64931957"
+CONFIG_SHA256="337eaa70feda5c58c7386adab6d7aaed7633fc257c45cb8acf0e4d03f5fb8161"
+
+verify_sha256() {
+	local expected=$1
+	local file=$2
+	local actual
+
+	command -v sha256sum >/dev/null 2>&1 || {
+		echo "ERROR: sha256sum is required for verified installation." >&2
+		return 1
+	}
+	actual=$(sha256sum "$file" | awk '{print $1}')
+	if [ "$actual" != "$expected" ]; then
+		echo "ERROR: SHA-256 verification failed for $file." >&2
+		return 1
+	fi
+}
+
 # Prefer IPv4 when fetching from GitHub, fallback to IPv6 if needed
 github_wget() {
 	local url=${!#}
@@ -94,16 +115,6 @@ normalize_service_names() {
 	printf '%s' "$normalized_services"
 }
 
-# Branch
-BRANCH="master"
-
-# Check if first argument is branch or SID
-if [ ${#1} -ne 32 ]
-then
-	BRANCH=$1
-	shift
-fi
-
 # Check if install script is run by root
 echo "Checking root privileges..."
 if [ "$EUID" -ne 0 ]
@@ -127,12 +138,12 @@ apply_agent_permissions() {
 	chmod 600 /etc/hetrixtools/hetrixtools.cfg || return 1
 }
 
-# Check if the selected branch exists
-if github_wget --spider -q https://raw.githubusercontent.com/hetrixtools/agent/$BRANCH/hetrixtools_agent.sh
+# Check if the pinned release exists
+if github_wget --spider -q "https://raw.githubusercontent.com/$REPOSITORY/$RELEASE_REF/hetrixtools_agent.sh"
 then
-	echo "Installing from $BRANCH branch..."
+	echo "Installing pinned release $RELEASE_REF from $REPOSITORY..."
 else
-	echo "ERROR: Branch $BRANCH does not exist." >&2
+	echo "ERROR: Pinned release $RELEASE_REF does not exist." >&2
 	exit 1
 fi
 
@@ -216,6 +227,10 @@ fi
 if [ "$USE_CRON" -ne 1 ] && [ "$SYSTEMCTL_AVAILABLE" -eq 1 ] && command -v systemd-run >/dev/null 2>&1; then
 	USE_SYSTEMD=1
 fi
+if [ "$SYSTEMCTL_AVAILABLE" -eq 1 ] && command -v systemd-run >/dev/null 2>&1; then
+	USE_CRON=0
+	USE_SYSTEMD=1
+fi
 if [ "$USE_CRON" -ne 1 ] && [ "$USE_SYSTEMD" -ne 1 ]; then
 	echo "ERROR: Neither cron nor systemd with systemd-run is available to schedule the agent." >&2
 	exit 1
@@ -240,20 +255,22 @@ echo "... done."
 
 # Fetching the agent
 echo "Fetching the agent..."
-if ! github_wget -t 1 -T 30 -qO /etc/hetrixtools/hetrixtools_agent.sh https://raw.githubusercontent.com/hetrixtools/agent/$BRANCH/hetrixtools_agent.sh
+if ! github_wget -t 1 -T 30 -qO /etc/hetrixtools/hetrixtools_agent.sh "https://raw.githubusercontent.com/$REPOSITORY/$RELEASE_REF/hetrixtools_agent.sh"
 then
 	echo "ERROR: Failed to download the agent script from GitHub." >&2
 	exit 1
 fi
+verify_sha256 "$AGENT_SHA256" /etc/hetrixtools/hetrixtools_agent.sh || exit 1
 echo "... done."
 
 # Fetching the config file
 echo "Fetching the config file..."
-if ! github_wget -t 1 -T 30 -qO /etc/hetrixtools/hetrixtools.cfg https://raw.githubusercontent.com/hetrixtools/agent/$BRANCH/hetrixtools.cfg
+if ! github_wget -t 1 -T 30 -qO /etc/hetrixtools/hetrixtools.cfg "https://raw.githubusercontent.com/$REPOSITORY/$RELEASE_REF/hetrixtools.cfg"
 then
 	echo "ERROR: Failed to download the agent configuration from GitHub." >&2
 	exit 1
 fi
+verify_sha256 "$CONFIG_SHA256" /etc/hetrixtools/hetrixtools.cfg || exit 1
 echo "... done."
 
 # Inserting Server ID (SID) into the agent config
@@ -408,11 +425,31 @@ RunID=$(date +%s)-$$
 UnitName="hetrixtools_agent_${RunID}"
 AgentCommand='exec /bin/bash /etc/hetrixtools/hetrixtools_agent.sh >> /etc/hetrixtools/hetrixtools_cron.log 2>&1'
 
+CommonProperties=(
+	--property="UMask=0077"
+	--property="NoNewPrivileges=yes"
+	--property="PrivateTmp=yes"
+	--property="ProtectSystem=strict"
+	--property="ProtectHome=yes"
+	--property="ReadWritePaths=/etc/hetrixtools"
+	--property="ProtectKernelTunables=yes"
+	--property="ProtectKernelModules=yes"
+	--property="ProtectControlGroups=yes"
+	--property="RestrictSUIDSGID=yes"
+	--property="LockPersonality=yes"
+	--property="MemoryDenyWriteExecute=yes"
+)
+
 if [ "$ServiceUser" = "root" ]
 then
-	systemd-run --quiet --collect --unit="$UnitName" /bin/bash -c "$AgentCommand"
+	systemd-run --quiet --collect --unit="$UnitName" "${CommonProperties[@]}" /bin/bash -c "$AgentCommand"
 else
-	systemd-run --quiet --collect --unit="$UnitName" --property="User=$ServiceUser" /bin/bash -c "$AgentCommand"
+	systemd-run --quiet --collect --unit="$UnitName" \
+		--property="User=hetrixtools" \
+		--property="Group=hetrixtools" \
+		--property="PrivateDevices=yes" \
+		"${CommonProperties[@]}" \
+		/bin/bash -c "$AgentCommand"
 fi
 EOF
 	chown root:root /usr/local/sbin/hetrixtools_systemd_launcher.sh >/dev/null 2>&1
@@ -424,6 +461,17 @@ Description=HetrixTools Agent Launcher
 [Service]
 Type=oneshot
 ExecStart=/bin/bash /usr/local/sbin/hetrixtools_systemd_launcher.sh $SERVICE_USER
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
 EOF
 	cat > /etc/systemd/system/hetrixtools_agent.timer <<-EOF
 [Unit]
@@ -463,15 +511,9 @@ POST="v=install&s=$SID"
 wget -t 1 -T 30 -qO- --post-data "$POST" https://sm.hetrixtools.net/ &> /dev/null
 echo "... done."
 
-# Start the agent
-if [ "$RUN_USER" = "root" ]
-then
-	echo "Starting the agent under the 'root' user..."
-	bash /etc/hetrixtools/hetrixtools_agent.sh > /dev/null 2>&1 &
-else
-	echo "Starting the agent under the 'hetrixtools' user..."
-	sudo -u hetrixtools bash /etc/hetrixtools/hetrixtools_agent.sh > /dev/null 2>&1 &
-fi
+# Start the agent through the hardened systemd unit.
+echo "Starting the hardened agent service..."
+systemctl start hetrixtools_agent.service >/dev/null 2>&1
 echo "... done."
 
 # All done

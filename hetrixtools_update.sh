@@ -22,6 +22,27 @@
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 umask 077
 
+REPOSITORY="bazterpro/agent"
+RELEASE_REF="secure-v2.4.1-1"
+AGENT_SHA256="8be4502fac533e5dfb60533b5b2ab85510fe2b961948e1cf573bde6d64931957"
+CONFIG_SHA256="337eaa70feda5c58c7386adab6d7aaed7633fc257c45cb8acf0e4d03f5fb8161"
+
+verify_sha256() {
+	local expected=$1
+	local file=$2
+	local actual
+
+	command -v sha256sum >/dev/null 2>&1 || {
+		echo "ERROR: sha256sum is required for verified updates." >&2
+		return 1
+	}
+	actual=$(sha256sum "$file" | awk '{print $1}')
+	if [ "$actual" != "$expected" ]; then
+		echo "ERROR: SHA-256 verification failed for $file." >&2
+		return 1
+	fi
+}
+
 # Prefer IPv4 when fetching from GitHub, fallback to IPv6 if needed
 github_wget() {
 	local url=${!#}
@@ -171,8 +192,6 @@ AGENT="/etc/hetrixtools/hetrixtools_agent.sh"
 # Old Config Path
 CONFIG="/etc/hetrixtools/hetrixtools.cfg"
 
-BRANCH="master"
-BRANCH_SET=0
 FORCE_UPDATE=0
 
 # Parse arguments
@@ -183,23 +202,17 @@ do
 			FORCE_UPDATE=1
 			;;
 		-h|--help)
-			echo "Usage: $0 [-force|--force] [branch]"
+			echo "Usage: $0 [-force|--force]"
 			exit 0
 			;;
 		-*)
 			echo "ERROR: Unknown option: $ARG" >&2
-			echo "Usage: $0 [-force|--force] [branch]" >&2
+			echo "Usage: $0 [-force|--force]" >&2
 			exit 1
 			;;
 		*)
-			if [ "$BRANCH_SET" -eq 1 ]
-			then
-				echo "ERROR: Multiple branches specified." >&2
-				echo "Usage: $0 [-force|--force] [branch]" >&2
-				exit 1
-			fi
-			BRANCH=$ARG
-			BRANCH_SET=1
+			echo "ERROR: Custom branches are disabled; updates are pinned to $RELEASE_REF." >&2
+			exit 1
 			;;
 	esac
 done
@@ -481,11 +494,12 @@ STAGED_CONFIG="$CONFIG.update.$$"
 
 # Fetching the available agent to check its version
 echo "Checking available agent version..."
-if ! github_wget -t 1 -T 30 -qO "$NEW_AGENT" https://raw.githubusercontent.com/hetrixtools/agent/$BRANCH/hetrixtools_agent.sh
+if ! github_wget -t 1 -T 30 -qO "$NEW_AGENT" "https://raw.githubusercontent.com/$REPOSITORY/$RELEASE_REF/hetrixtools_agent.sh"
 then
-	echo "ERROR: Failed to download the agent script from GitHub for branch/tag $BRANCH." >&2
+	echo "ERROR: Failed to download the agent script from pinned release $RELEASE_REF." >&2
 	exit 1
 fi
+verify_sha256 "$AGENT_SHA256" "$NEW_AGENT" || exit 1
 CURRENT_VERSION=$(extract_agent_version "$AGENT")
 AVAILABLE_VERSION=$(extract_agent_version "$NEW_AGENT")
 DISPLAY_CURRENT_VERSION=$CURRENT_VERSION
@@ -572,6 +586,10 @@ fi
 if [ "$USE_CRON" -ne 1 ] && [ "$SYSTEMCTL_AVAILABLE" -eq 1 ] && command -v systemd-run >/dev/null 2>&1; then
 	USE_SYSTEMD=1
 fi
+if [ "$SYSTEMCTL_AVAILABLE" -eq 1 ] && command -v systemd-run >/dev/null 2>&1; then
+	USE_CRON=0
+	USE_SYSTEMD=1
+fi
 if [ "$USE_CRON" -ne 1 ] && [ "$USE_SYSTEMD" -ne 1 ]; then
 	echo "ERROR: Neither cron nor systemd with systemd-run is available to schedule the agent." >&2
 	exit 1
@@ -643,8 +661,7 @@ if [ -f "$CONFIG" ]
 then
 	# Custom Variables
 	CustomVars=$(extract_config_value 'CustomVars' "$EXTRACT")
-	# Secured Connection
-	SecuredConnection=$(normalize_secured_connection "$(extract_config_value 'SecuredConnection' "$EXTRACT")")
+	SecuredConnection=1
 	# CollectEveryXSeconds
 	CollectEveryXSeconds=$(normalize_collect_interval "$(extract_config_value 'CollectEveryXSeconds' "$EXTRACT")")
 	# OutgoingPings
@@ -655,11 +672,12 @@ fi
 
 # Fetching the new config file
 echo "Fetching the new config file..."
-if ! github_wget -t 1 -T 30 -qO "$NEW_CONFIG" https://raw.githubusercontent.com/hetrixtools/agent/$BRANCH/hetrixtools.cfg
+if ! github_wget -t 1 -T 30 -qO "$NEW_CONFIG" "https://raw.githubusercontent.com/$REPOSITORY/$RELEASE_REF/hetrixtools.cfg"
 then
 	echo "ERROR: Failed to download the agent configuration from GitHub." >&2
 	exit 1
 fi
+verify_sha256 "$CONFIG_SHA256" "$NEW_CONFIG" || exit 1
 echo "... done."
 
 # Preparing the new agent and config file
@@ -775,14 +793,7 @@ then
 fi
 echo "... done."
 
-# Check if secured connection is enabled
-echo "Checking if secured connection is enabled..."
-if [ ! -z "$SecuredConnection" ]
-then
-	echo "Inserting secured connection in the agent config..."
-	replace_config_line "$STAGED_CONFIG" 'SecuredConnection=1' "SecuredConnection=$SecuredConnection"
-fi
-echo "... done."
+# TLS certificate verification is mandatory in this hardened fork.
 
 # Check CollectEveryXSeconds
 echo "Checking CollectEveryXSeconds..."
@@ -893,11 +904,31 @@ RunID=$(date +%s)-$$
 UnitName="hetrixtools_agent_${RunID}"
 AgentCommand='exec /bin/bash /etc/hetrixtools/hetrixtools_agent.sh >> /etc/hetrixtools/hetrixtools_cron.log 2>&1'
 
+CommonProperties=(
+	--property="UMask=0077"
+	--property="NoNewPrivileges=yes"
+	--property="PrivateTmp=yes"
+	--property="ProtectSystem=strict"
+	--property="ProtectHome=yes"
+	--property="ReadWritePaths=/etc/hetrixtools"
+	--property="ProtectKernelTunables=yes"
+	--property="ProtectKernelModules=yes"
+	--property="ProtectControlGroups=yes"
+	--property="RestrictSUIDSGID=yes"
+	--property="LockPersonality=yes"
+	--property="MemoryDenyWriteExecute=yes"
+)
+
 if [ "$ServiceUser" = "root" ]
 then
-	systemd-run --quiet --collect --unit="$UnitName" /bin/bash -c "$AgentCommand"
+	systemd-run --quiet --collect --unit="$UnitName" "${CommonProperties[@]}" /bin/bash -c "$AgentCommand"
 else
-	systemd-run --quiet --collect --unit="$UnitName" --property="User=$ServiceUser" /bin/bash -c "$AgentCommand"
+	systemd-run --quiet --collect --unit="$UnitName" \
+		--property="User=hetrixtools" \
+		--property="Group=hetrixtools" \
+		--property="PrivateDevices=yes" \
+		"${CommonProperties[@]}" \
+		/bin/bash -c "$AgentCommand"
 fi
 EOF
 	chown root:root /usr/local/sbin/hetrixtools_systemd_launcher.sh >/dev/null 2>&1
@@ -909,6 +940,17 @@ EOF
 		[Service]
 		Type=oneshot
 		ExecStart=/bin/bash /usr/local/sbin/hetrixtools_systemd_launcher.sh $SERVICE_USER
+		UMask=0077
+		NoNewPrivileges=yes
+		PrivateTmp=yes
+		ProtectSystem=strict
+		ProtectHome=yes
+		ProtectKernelTunables=yes
+		ProtectKernelModules=yes
+		ProtectControlGroups=yes
+		RestrictSUIDSGID=yes
+		LockPersonality=yes
+		MemoryDenyWriteExecute=yes
 		EOF
 	cat > /etc/systemd/system/hetrixtools_agent.timer <<-EOF
 		[Unit]
