@@ -6,7 +6,7 @@ installed servers automatically.
 ## Trust boundaries
 
 - Runtime code and updates are fetched only from `bazterpro/agent`.
-- The release ref is pinned to `secure-v2.4.1-1`; branch arguments are rejected.
+- The release ref is pinned to `full-monitoring-v2.4.1-1`; branch arguments are rejected.
 - The locally trusted installer/updater contains the expected SHA-256 values
   for `hetrixtools_agent.sh` and `hetrixtools.cfg`.
 - There is no automatic upstream synchronization workflow.
@@ -18,23 +18,17 @@ installer/updater has been reviewed. A repository-account compromise can still
 replace a newly downloaded installer, so always verify the installer itself
 against a checksum kept outside the repository before executing it.
 
-## Runtime modes
+## Runtime mode
 
-The dashboard-generated second installer argument selects the runtime mode:
-
-- `0`: run as `hetrixtools`, with `PrivateDevices=yes`.
-- `1`: run as `root`, without `PrivateDevices`, so SMART, RAID and NVMe metrics
-  remain available.
-
-Both modes use mandatory TLS verification and systemd hardening including
-`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
-`ProtectKernelTunables`, `ProtectKernelModules`, `ProtectControlGroups`,
-`RestrictSUIDSGID`, `LockPersonality`, and `MemoryDenyWriteExecute`.
+The agent intentionally runs as `root` without a systemd sandbox. This provides
+full access to SMART, RAID, NVMe, process and other supported host metrics.
+The fork's protection is focused on the software supply chain: pinned code,
+manual updates, SHA-256 verification and mandatory TLS.
 
 ## Running processes
 
-Process monitoring is available for operational diagnostics. When enabled,
-the upstream-compatible payload includes full command lines. Avoid placing
+Process monitoring is forced on for operational diagnostics. The
+upstream-compatible payload includes full command lines, so avoid placing
 passwords or API tokens in process arguments.
 
 ## Updating

@@ -31,10 +31,10 @@ SID=""
 NetworkInterfaces=""
 IgnoredDisks="tmpfs|aufs|squashfs|container_tmp"
 CheckServices=""
-CheckSoftRAID=0
-CheckDriveHealth=0
+CheckSoftRAID=1
+CheckDriveHealth=1
 CheckReboot=1
-RunningProcesses=0
+RunningProcesses=1
 ConnectionPorts=""
 CustomVars="custom_variables.json"
 SecuredConnection=1
@@ -206,9 +206,9 @@ then
 fi
 DisksIgnoreFilter="$IgnoredDisks"
 CheckReboot=$(normalize_binary_setting "$CheckReboot" 1)
-CheckSoftRAID=$(normalize_binary_setting "$CheckSoftRAID" 0)
-CheckDriveHealth=$(normalize_binary_setting "$CheckDriveHealth" 0)
-RunningProcesses=$(normalize_binary_setting "$RunningProcesses" 0)
+CheckSoftRAID=1
+CheckDriveHealth=1
+RunningProcesses=1
 DEBUG=$(normalize_binary_setting "$DEBUG" 0)
 CollectEveryXSeconds=$(printf '%s' "$CollectEveryXSeconds" | tr -d '[:space:]')
 if ! [[ "$CollectEveryXSeconds" =~ ^[0-9]{1,2}$ ]] || [ "$CollectEveryXSeconds" -lt 1 ] || [ "$CollectEveryXSeconds" -gt 60 ]

@@ -23,9 +23,9 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 umask 077
 
 REPOSITORY="bazterpro/agent"
-RELEASE_REF="secure-v2.4.1-1"
-AGENT_SHA256="8be4502fac533e5dfb60533b5b2ab85510fe2b961948e1cf573bde6d64931957"
-CONFIG_SHA256="337eaa70feda5c58c7386adab6d7aaed7633fc257c45cb8acf0e4d03f5fb8161"
+RELEASE_REF="full-monitoring-v2.4.1-1"
+AGENT_SHA256="d0a40bf8b9815222f1aefb6c77ed2aa7f5f97a60e884c552ef2aa878974409f2"
+CONFIG_SHA256="6fbfdbfa8ffb8061522044118a68d28e7db80740d1019d53f69fb2ca6edff626"
 
 verify_sha256() {
 	local expected=$1
@@ -163,18 +163,8 @@ if [ -z "$2" ]
 	then echo "ERROR: Second parameter missing."
 	exit
 fi
-case "$2" in
-	1)
-		RUN_USER=root
-		;;
-	0)
-		RUN_USER=hetrixtools
-		;;
-	*)
-		echo "ERROR: Second parameter must be 0 for 'hetrixtools' or 1 for 'root'." >&2
-		exit 1
-		;;
-esac
+# This fork intentionally runs as root to expose all supported metrics.
+RUN_USER=root
 
 # Check for wget and cron/systemd availability
 echo "Checking system utilities..."
@@ -425,32 +415,7 @@ RunID=$(date +%s)-$$
 UnitName="hetrixtools_agent_${RunID}"
 AgentCommand='exec /bin/bash /etc/hetrixtools/hetrixtools_agent.sh >> /etc/hetrixtools/hetrixtools_cron.log 2>&1'
 
-CommonProperties=(
-	--property="UMask=0077"
-	--property="NoNewPrivileges=yes"
-	--property="PrivateTmp=yes"
-	--property="ProtectSystem=strict"
-	--property="ProtectHome=yes"
-	--property="ReadWritePaths=/etc/hetrixtools"
-	--property="ProtectKernelTunables=yes"
-	--property="ProtectKernelModules=yes"
-	--property="ProtectControlGroups=yes"
-	--property="RestrictSUIDSGID=yes"
-	--property="LockPersonality=yes"
-	--property="MemoryDenyWriteExecute=yes"
-)
-
-if [ "$ServiceUser" = "root" ]
-then
-	systemd-run --quiet --collect --unit="$UnitName" "${CommonProperties[@]}" /bin/bash -c "$AgentCommand"
-else
-	systemd-run --quiet --collect --unit="$UnitName" \
-		--property="User=hetrixtools" \
-		--property="Group=hetrixtools" \
-		--property="PrivateDevices=yes" \
-		"${CommonProperties[@]}" \
-		/bin/bash -c "$AgentCommand"
-fi
+systemd-run --quiet --collect --unit="$UnitName" /bin/bash -c "$AgentCommand"
 EOF
 	chown root:root /usr/local/sbin/hetrixtools_systemd_launcher.sh >/dev/null 2>&1
 	chmod 700 /usr/local/sbin/hetrixtools_systemd_launcher.sh
@@ -461,17 +426,6 @@ Description=HetrixTools Agent Launcher
 [Service]
 Type=oneshot
 ExecStart=/bin/bash /usr/local/sbin/hetrixtools_systemd_launcher.sh $SERVICE_USER
-UMask=0077
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=strict
-ProtectHome=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-MemoryDenyWriteExecute=yes
 EOF
 	cat > /etc/systemd/system/hetrixtools_agent.timer <<-EOF
 [Unit]
